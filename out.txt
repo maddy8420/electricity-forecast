@@ -1,0 +1,8 @@
+(3707, 38)
+['date', 'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chandigarh', 'Chhattisgarh', 'DD', 'Delhi', 'DNH', 'DVC', 'Essar steel', 'Goa', 'Gujarat', 'Haryana', 'HP', 'J&K', 'Jharkhand', 'Karnataka', 'Kerala', 'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram', 'MP', 'Nagaland', 'Odisha', 'Pondy', 'Punjab', 'Rajasthan', 'Sikkim', 'Tamil Nadu', 'Telangana', 'Tripura', 'UP', 'Uttarakhand', 'West Bengal', 'Total Consumption']
+        date  Andhra Pradesh  ...  West Bengal  Total Consumption
+0 2013-01-06           251.5  ...        107.5             2845.7
+1 2013-01-07           257.9  ...        106.6             2876.7
+2 2013-01-08           265.1  ...        103.9             2923.0
+
+[3 rows x 38 columns]
