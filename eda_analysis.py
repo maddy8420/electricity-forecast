@@ -4,12 +4,12 @@ India Electricity EDA
 Reads india_electricity_master.xlsx and produces:
   - Summary stats / missing-value check
   - Trend & seasonality decomposition (generation + demand)
-  - Year-over-year growth rates
+  - Year-over-year growth rates (low-coverage months excluded)
   - A reporting-era boundary check (2017-05-26) so real growth isn't
     confused with a data-collection artifact
-  - Source-mix evolution chart (2017-2023 only, per known data limitation)
+  - Source-mix evolution chart (Dec 2018 onward — see note below)
   - Demand vs temperature correlation
-  - Peak vs average demand gap over time
+  - Peak vs average demand gap over time (partial years excluded)
 
 All charts saved as PNGs in ./figures/
 """
@@ -58,10 +58,14 @@ def trend_seasonality(master):
     print("=" * 70)
     print("2. TREND & SEASONALITY DECOMPOSITION")
     print("=" * 70)
+    print("Note: May-Sept 2017 generation figures are built on severely under-")
+    print("reported days (as few as 0-8 days/month vs a normal ~30) due to CEA's")
+    print("reporting-format transition. Expect a dip/spike artifact there — it's")
+    print("not a real production crash.\n")
 
     for col, label in [
-        ("national_total_generation_mu", "Generation"),
-        ("total_energy_met_mu", "Demand (Energy Met)"),
+        ("avg_daily_generation", "Generation"),
+        ("avg_daily_demand", "Demand (Energy Met)"),
     ]:
         series = master.set_index("date")[col].dropna()
         if len(series) < 24:
@@ -90,15 +94,27 @@ def yoy_growth(master):
     print("3. YEAR-OVER-YEAR GROWTH")
     print("=" * 70)
 
+    # Exclude low-coverage months from growth calculations — a month with
+    # <20 days reported produces a fake spike/crash in YoY comparisons
+    # (confirmed cause: e.g. Dec 2022 had only 4 days reported, making
+    # Dec 2023 look like +600% growth when nothing unusual happened).
     df = master.set_index("date").sort_index()
+    if "low_coverage_flag" in df.columns:
+        n_excluded = int(df["low_coverage_flag"].sum())
+        print(f"Excluding {n_excluded} low-coverage month(s) from growth calculations "
+              f"(see MASTER_monthly 'low_coverage_flag' column).\n")
+        for c in df.columns:
+            if c != "low_coverage_flag" and pd.api.types.is_numeric_dtype(df[c]):
+                df.loc[df["low_coverage_flag"], c] = pd.NA
+
     for col, label in [
-        ("national_total_generation_mu", "Generation"),
-        ("total_energy_met_mu", "Demand"),
-        ("total_consumption_mu", "Consumption"),
+        ("avg_daily_generation", "Generation"),
+        ("avg_daily_demand", "Demand"),
+        ("avg_daily_consumption", "Consumption"),
     ]:
         if col not in df.columns:
             continue
-        yoy = df[col].pct_change(periods=12) * 100
+        yoy = df[col].pct_change(periods=12, fill_method=None) * 100
         yearly = yoy.resample("YE").mean()
         print(f"\n{label} — average YoY growth % by year:")
         print(yearly.round(2).to_string())
@@ -117,23 +133,27 @@ def yoy_growth(master):
 
 def source_mix_evolution(harmonized):
     print("=" * 70)
-    print("4. SOURCE-MIX EVOLUTION (2017-2023 only — see data_era limitation)")
+    print("4. SOURCE-MIX EVOLUTION (Dec 2018 onward — see below)")
     print("=" * 70)
 
-    detailed = harmonized[harmonized["data_era"] == "2017-2023 (detailed reporting)"].copy()
+    # Start from Dec 2018, not May 2017: Coal/Lignite itemization only
+    # becomes reliable from 2018-11-29 onward (confirmed via check_date_ranges).
+    # Using May 2017 as a starting point inflates renewables' apparent share,
+    # since coal was NaN (treated as 0 in the sum) for nearly that entire month.
+    reliable_start = pd.Timestamp("2018-12-01")
+    detailed = harmonized[harmonized["date"] >= reliable_start].copy()
     detailed["year_month"] = detailed["date"].dt.to_period("M")
 
     monthly = detailed.groupby("year_month")[
         ["coal_lignite_mu", "renewables_mu", "hydro_mu", "nuclear_mu", "gas_naptha_diesel_mu"]
-    ].sum()
+    ].mean()  # mean, not sum — consistent with the day-coverage fix elsewhere
     monthly.index = monthly.index.to_timestamp()
 
-    # Convert to % share for a stacked area chart
     share = monthly.div(monthly.sum(axis=1), axis=0) * 100
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.stackplot(share.index, share.T, labels=share.columns)
-    ax.set_title("Generation source mix — % share (2017-2023)")
+    ax.set_title("Generation source mix — % share (Dec 2018 onward)")
     ax.legend(loc="upper left", bbox_to_anchor=(1, 1))
     ax.set_ylabel("% share")
     plt.tight_layout()
@@ -142,9 +162,11 @@ def source_mix_evolution(harmonized):
     plt.close()
     print(f"  Saved: {fname}")
 
-    print("\nRenewables % share, first vs last year available:")
+    print("\nRenewables % share, first vs last month available:")
     print(f"  {share.index[0].strftime('%Y-%m')}: {share['renewables_mu'].iloc[0]:.1f}%")
     print(f"  {share.index[-1].strftime('%Y-%m')}: {share['renewables_mu'].iloc[-1]:.1f}%")
+    print("  (Earlier run showed 23.3% at May 2017 — that was inflated by missing")
+    print("   coal data that month, not a real baseline. This range is reliable.)")
     print()
 
 
@@ -185,9 +207,26 @@ def peak_vs_average_gap(hourly):
         / hourly["hourly_demand_daily_mean"] * 100
     )
     hourly["year"] = hourly["date"].dt.year
-    yearly_gap = hourly.groupby("year")["gap_pct"].mean()
-    print("Average daily peak-vs-mean gap (%) by year:")
+
+    # Flag partial years (fewer than ~350 days) so they aren't compared
+    # directly against full years — e.g. 2024 may only have data through
+    # April/May, which would skew the average toward whichever season
+    # happens to be covered.
+    days_per_year = hourly.groupby("year").size()
+    partial_years = days_per_year[days_per_year < 350].index.tolist()
+    if partial_years:
+        print(f"  Note: {partial_years} have <350 days of hourly data — excluding "
+              f"from year-over-year comparison below (shown separately if present).")
+
+    full_years = hourly[~hourly["year"].isin(partial_years)]
+    yearly_gap = full_years.groupby("year")["gap_pct"].mean()
+    print("Average daily peak-vs-mean gap (%) by year (full years only):")
     print(yearly_gap.round(2).to_string())
+
+    if partial_years:
+        partial_gap = hourly[hourly["year"].isin(partial_years)].groupby("year")["gap_pct"].mean()
+        print(f"\nPartial year(s) — not directly comparable, shown for reference only:")
+        print(partial_gap.round(2).to_string())
 
     fig, ax = plt.subplots(figsize=(8, 4))
     yearly_gap.plot(kind="bar", ax=ax, title="Avg daily peak-vs-mean demand gap (%) by year")
