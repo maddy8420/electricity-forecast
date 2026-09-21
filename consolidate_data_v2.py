@@ -223,23 +223,59 @@ def build_hourly_agg_daily(hourly_load):
 
 
 def build_monthly_master(total_reported, harmonized, demand_daily, hourly_daily, consumption, temp):
+    """
+    Roll up to monthly resolution using AVERAGE DAILY VALUE, not sum.
+
+    Why: several months in the raw data have severe under-reporting
+    (e.g. Dec 2022 has only 4 days reported vs a normal ~30). Summing those
+    days produces a monthly 'total' that's mechanically tiny compared to a
+    fully-reported month — which then creates fake 600%+ YoY growth spikes
+    a year later when compared against a properly-reported month. Averaging
+    the days that WERE reported is far more robust to uneven coverage.
+
+    A day-coverage count is kept alongside every metric so any month with
+    suspiciously low coverage can be flagged/filtered rather than silently
+    trusted.
+    """
     def to_month(df, date_col="date"):
         out = df.copy()
         out["year_month"] = pd.to_datetime(out[date_col]).dt.to_period("M")
         return out
 
-    gen_m = to_month(total_reported).groupby("year_month")["national_total_generation_mu"].sum()
-    coal_m = to_month(harmonized).groupby("year_month")["coal_lignite_mu"].sum().rename("coal_lignite_mu")
-    ren_m = to_month(harmonized).groupby("year_month")["renewables_mu"].sum().rename("renewables_mu")
-    hydro_m = to_month(harmonized).groupby("year_month")["hydro_mu"].sum().rename("hydro_mu")
-    nuclear_m = to_month(harmonized).groupby("year_month")["nuclear_mu"].sum().rename("nuclear_mu")
-    dem_m = to_month(demand_daily).groupby("year_month")["national_energy_met_mu"].sum().rename("total_energy_met_mu")
-    hr_m = to_month(hourly_daily).groupby("year_month")["hourly_demand_daily_max"].max().rename("monthly_peak_demand_mw")
-    con_m = to_month(consumption).groupby("year_month")["Total Consumption"].sum().rename("total_consumption_mu")
+    def monthly_mean_and_coverage(df, value_col, out_name):
+        g = to_month(df).groupby("year_month")[value_col]
+        result = g.agg(["mean", "count"])
+        result.columns = [f"avg_daily_{out_name}", f"days_reported_{out_name}"]
+        return result
 
-    master = pd.concat([gen_m, coal_m, ren_m, hydro_m, nuclear_m, dem_m, hr_m, con_m], axis=1).reset_index()
+    gen_m = monthly_mean_and_coverage(total_reported, "national_total_generation_mu", "generation")
+    coal_m = monthly_mean_and_coverage(harmonized, "coal_lignite_mu", "coal_lignite")
+    ren_m = monthly_mean_and_coverage(harmonized, "renewables_mu", "renewables")
+    hydro_m = monthly_mean_and_coverage(harmonized, "hydro_mu", "hydro")
+    nuclear_m = monthly_mean_and_coverage(harmonized, "nuclear_mu", "nuclear")
+    dem_m = monthly_mean_and_coverage(demand_daily, "national_energy_met_mu", "demand")
+    con_m = monthly_mean_and_coverage(consumption, "Total Consumption", "consumption")
+    hr_m = to_month(hourly_daily).groupby("year_month")["hourly_demand_daily_max"].max().rename("monthly_peak_demand_mw")
+
+    master = pd.concat([gen_m, coal_m, ren_m, hydro_m, nuclear_m, dem_m, con_m, hr_m], axis=1).reset_index()
     master = master.merge(temp[["year_month", "Monthly_load", "max_temp"]], on="year_month", how="left")
     master["year_month"] = master["year_month"].astype(str)
+
+    # Flag low-coverage months — but only using metrics that are tracked
+    # across the ENTIRE date range (generation, demand, consumption,
+    # renewables, hydro). Coal/Nuclear/Gas are deliberately NaN for the
+    # whole 2013-2017 era (structural limitation, not a coverage problem)
+    # — including their coverage columns here would wrongly flag ~50 months
+    # that have perfectly good demand/generation data just because coal
+    # wasn't itemized yet.
+    core_coverage_cols = [
+        "days_reported_generation", "days_reported_demand",
+        "days_reported_consumption", "days_reported_renewables",
+        "days_reported_hydro",
+    ]
+    core_coverage_cols = [c for c in core_coverage_cols if c in master.columns]
+    master["low_coverage_flag"] = (master[core_coverage_cols] < 20).any(axis=1)
+
     return master
 
 
@@ -278,24 +314,44 @@ def main():
         total_reported, harmonized, demand_daily, hourly_daily, consumption, monthly_temp
     )
 
-    print(f"Writing {OUTPUT_FILE}...")
-    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-        raw_wide.to_excel(writer, sheet_name="raw_gen_by_source_wide", index=False)
-        state_demand.to_excel(writer, sheet_name="raw_state_demand", index=False)
-        consumption.to_excel(writer, sheet_name="raw_consumption", index=False)
-        monthly_temp.to_excel(writer, sheet_name="raw_monthly_temp", index=False)
+    def save_sheets(filename):
+        with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+            raw_wide.to_excel(writer, sheet_name="raw_gen_by_source_wide", index=False)
+            state_demand.to_excel(writer, sheet_name="raw_state_demand", index=False)
+            consumption.to_excel(writer, sheet_name="raw_consumption", index=False)
+            monthly_temp.to_excel(writer, sheet_name="raw_monthly_temp", index=False)
 
-        harmonized.to_excel(writer, sheet_name="gen_by_source_harmonized", index=False)
-        total_reported.to_excel(writer, sheet_name="national_gen_total_daily", index=False)
-        demand_daily.to_excel(writer, sheet_name="national_demand_daily", index=False)
-        hourly_daily.to_excel(writer, sheet_name="hourly_agg_daily", index=False)
-        monthly_master.to_excel(writer, sheet_name="MASTER_monthly", index=False)
+            harmonized.to_excel(writer, sheet_name="gen_by_source_harmonized", index=False)
+            total_reported.to_excel(writer, sheet_name="national_gen_total_daily", index=False)
+            demand_daily.to_excel(writer, sheet_name="national_demand_daily", index=False)
+            hourly_daily.to_excel(writer, sheet_name="hourly_agg_daily", index=False)
+            monthly_master.to_excel(writer, sheet_name="MASTER_monthly", index=False)
+
+    print(f"Writing {OUTPUT_FILE}...")
+    try:
+        save_sheets(OUTPUT_FILE)
+    except PermissionError:
+        fallback_file = "india_electricity_master_new.xlsx"
+        print(f"\n[WARNING] Permission denied when writing to '{OUTPUT_FILE}'.")
+        print(f"  The file is currently open in Excel or another application.")
+        print(f"  Saving output to '{fallback_file}' instead...")
+        try:
+            save_sheets(fallback_file)
+            print(f"Successfully saved to '{fallback_file}'.")
+        except Exception as e:
+            print(f"[ERROR] Failed to save fallback file as well: {e}")
+            raise
 
     print("Done.")
     print("\nKey sheets:")
     print("  - national_gen_total_daily : trusted daily total generation (reported, not recomputed)")
     print("  - gen_by_source_harmonized : continuous per-source series across the reporting-format change")
-    print("  - MASTER_monthly           : everything joined at monthly resolution, ready for EDA")
+    print("  - MASTER_monthly           : monthly averages (not sums) + day-coverage flags, ready for EDA")
+
+    n_low_coverage = int(monthly_master["low_coverage_flag"].sum())
+    print(f"\n  {n_low_coverage} month(s) flagged as low-coverage (<20 days reported for at "
+          f"least one metric) — check MASTER_monthly's 'low_coverage_flag' column before "
+          f"trusting growth rates around those months.")
 
 
 if __name__ == "__main__":
