@@ -6,3 +6,5 @@ scikit-learn
 openpyxl
 streamlit
 plotly
+
+holidays
