@@ -49,8 +49,8 @@ OUTLIER_LO = 0.6
 # Minimum days in a month for the month to be used
 MIN_DAYS_MONTH = 20
 
-# Backtest profile variant: "dow" (DOW-only), "flat", "dow_shrunk", "dow_raw"
-PROFILE_VARIANT = "dow"
+# Backtest profile variant: "dow_shrunk" wins H1+H2 combined MAPE (see backtest())
+PROFILE_VARIANT = "dow_shrunk"
 
 
 def _get_india_holidays(year: int) -> dict:

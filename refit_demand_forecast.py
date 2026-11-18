@@ -1,20 +1,21 @@
 """
-refit_demand_forecast.py  (Phase C)
--------------------------------------
-Re-fits SARIMAX(1,1,2)×(0,1,1,12) on avg_daily_consumption exactly as
-final_forecast.py does (same preprocessing and training window logic,
-same order and options) but selects the optimizer setting that gives the
-most stable result, and writes the forecast to a NEW file so the original
-avg_daily_demand_forecast_2040.xlsx is not overwritten.
+refit_demand_forecast.py  (Phase C — ensemble rewrite)
+--------------------------------------------------------
+Re-fits SARIMAX(1,1,2)x(0,1,1,12) on avg_daily_consumption exactly as
+final_forecast.py does (same preprocessing, same order/options).
 
-Output:
+Selection:  Holdout MAPE over 2023-10..2024-09 ranks all four
+            (enforce, method) configurations. Configurations whose
+            holdout MAPE is within ENSEMBLE_TOLERANCE pp of the best
+            are included in the ensemble.
+
+Ensemble:   Fit each member on the FULL series. Forecast = mean of
+            member point forecasts; CI bounds = mean of each member's
+            CI bound (not a wider joint interval).  Same schema and
+            is_validated_horizon flag as the original file.
+
+Output (NEW file — does NOT overwrite original):
     avg_daily_demand_forecast_2040_refit.xlsx
-    (same schema: index=date, columns=forecast/ci_lower_95/ci_upper_95/
-     is_validated_horizon; monthly range 2024-10 onward; 24-month
-     validated flag)
-
-Usage:
-    python refit_demand_forecast.py
 """
 
 import warnings
@@ -33,11 +34,15 @@ INPUT_FILE     = BASE_DIR / "india_electricity_features.xlsx"
 OUTPUT_FILE    = BASE_DIR / "avg_daily_demand_forecast_2040_refit.xlsx"
 SAVED_FILE     = BASE_DIR / "avg_daily_demand_forecast_2040.xlsx"
 
-TARGET_COL            = "avg_daily_consumption"   # same as what final_forecast.py used
+TARGET_COL            = "avg_daily_consumption"
 BEST_ORDER            = (1, 1, 2)
 BEST_SEASONAL_ORDER   = (0, 1, 1, 12)
 FORECAST_END          = "2040-12-01"
 VALIDATED_HORIZON_MONTHS = 24
+ENSEMBLE_TOLERANCE    = 0.1   # pp: include configs within this of best MAPE
+
+HOLDOUT_START = "2023-10"
+HOLDOUT_END   = "2024-09"
 
 COMPARISON_DATES = [
     pd.Timestamp("2024-10-01"),
@@ -47,8 +52,12 @@ COMPARISON_DATES = [
     pd.Timestamp("2040-12-01"),
 ]
 
-HOLDOUT_START = "2023-10"   # first month of holdout (12 months)
-HOLDOUT_END   = "2024-09"   # last month of holdout
+ALL_CONFIGS = [
+    {"enforce": False, "method": "lbfgs"},
+    {"enforce": False, "method": "powell"},
+    {"enforce": True,  "method": "lbfgs"},
+    {"enforce": True,  "method": "powell"},
+]
 
 
 # ---------------------------------------------------------------------------
@@ -64,16 +73,14 @@ def load_series() -> pd.Series:
 
 
 def fit_model(series: pd.Series, method: str = "lbfgs",
-              enforce_stationarity: bool = False,
-              enforce_invertibility: bool = False):
-    model = SARIMAX(
+              enforce: bool = False):
+    return SARIMAX(
         series,
         order=BEST_ORDER,
         seasonal_order=BEST_SEASONAL_ORDER,
-        enforce_stationarity=enforce_stationarity,
-        enforce_invertibility=enforce_invertibility,
+        enforce_stationarity=enforce,
+        enforce_invertibility=enforce,
     ).fit(disp=False, method=method)
-    return model
 
 
 def make_forecast(model, last_date: pd.Timestamp) -> pd.DataFrame:
@@ -84,44 +91,29 @@ def make_forecast(model, last_date: pd.Timestamp) -> pd.DataFrame:
     fc_df  = fc_res.summary_frame(alpha=0.05)
     fc_df.index.name = "date"
     fc_df = fc_df.rename(columns={
-        "mean":           "forecast",
-        "mean_ci_lower":  "ci_lower_95",
-        "mean_ci_upper":  "ci_upper_95",
+        "mean":          "forecast",
+        "mean_ci_lower": "ci_lower_95",
+        "mean_ci_upper": "ci_upper_95",
     })[["forecast", "ci_lower_95", "ci_upper_95"]]
-
     validated_cutoff = last_date + pd.DateOffset(months=VALIDATED_HORIZON_MONTHS)
     fc_df["is_validated_horizon"] = fc_df.index <= validated_cutoff
     return fc_df
 
 
-# ---------------------------------------------------------------------------
-# Holdout evaluation
-# ---------------------------------------------------------------------------
 def holdout_mape(series: pd.Series, method: str, enforce: bool) -> dict:
-    """
-    Fit on data before HOLDOUT_START, score on HOLDOUT_START..HOLDOUT_END.
-    Returns dict with mape, forecast df for the holdout window.
-    """
     train = series[series.index < HOLDOUT_START]
     test  = series[(series.index >= HOLDOUT_START) & (series.index <= HOLDOUT_END)]
-
     if len(train) == 0 or len(test) == 0:
-        return {"mape": float("nan"), "forecast_df": None}
-
-    model = fit_model(train, method=method,
-                      enforce_stationarity=enforce,
-                      enforce_invertibility=enforce)
+        return {"mape": float("nan")}
+    model = fit_model(train, method=method, enforce=enforce)
     fc_df = make_forecast(model, train.index[-1])
-
-    # Align with test
     common = fc_df.index.intersection(test.index)
     if len(common) == 0:
-        return {"mape": float("nan"), "forecast_df": fc_df}
-
+        return {"mape": float("nan")}
     pred   = fc_df.loc[common, "forecast"]
     actual = test.loc[common]
     mape   = float(np.mean(np.abs((actual.values - pred.values) / actual.values)) * 100)
-    return {"mape": mape, "forecast_df": fc_df.loc[common]}
+    return {"mape": mape}
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +121,7 @@ def holdout_mape(series: pd.Series, method: str, enforce: bool) -> dict:
 # ---------------------------------------------------------------------------
 def main():
     print("=" * 70)
-    print("refit_demand_forecast.py")
+    print("refit_demand_forecast.py  [ensemble]")
     print("=" * 70)
 
     series = load_series()
@@ -139,138 +131,141 @@ def main():
         f"n={len(series)}\n"
     )
 
-    # ---- Holdout evaluation: enforce=False vs enforce=True ----
+    # ---- Step 1: Holdout evaluation of all 4 configs ----
     print("Holdout evaluation (train < 2023-10, test 2023-10..2024-09):")
-    print(f"{'Setting':<35} {'Holdout MAPE':>14}")
-    print("-" * 52)
+    print(f"  {'Config':<35} {'Holdout MAPE':>14}  {'In ensemble?':>13}")
+    print("  " + "-" * 65)
 
-    holdout_results = {}
-    for enforce in [False, True]:
-        for method in ["lbfgs", "powell"]:
-            label = f"enforce={'True' if enforce else 'False'}, method={method}"
-            res = holdout_mape(series, method=method, enforce=enforce)
-            mape = res["mape"]
-            holdout_results[label] = mape
-            print(f"  {label:<33} {mape:>13.2f}%")
+    mape_map = {}
+    for cfg in ALL_CONFIGS:
+        label = f"enforce={cfg['enforce']}, method={cfg['method']}"
+        res   = holdout_mape(series, method=cfg["method"], enforce=cfg["enforce"])
+        mape_map[label] = res["mape"]
 
-    # ---- First 12 months: enforce=False lbfgs vs enforce=True lbfgs ----
-    print("\nFirst 12 holdout months — enforce=False (lbfgs) vs enforce=True (lbfgs):")
-    res_ef  = holdout_mape(series, method="lbfgs", enforce=False)
-    res_et  = holdout_mape(series, method="lbfgs", enforce=True)
-    fc_ef   = res_ef["forecast_df"]
-    fc_et   = res_et["forecast_df"]
+    best_mape = min(v for v in mape_map.values() if not np.isnan(v))
 
-    test_months = series[(series.index >= HOLDOUT_START) & (series.index <= HOLDOUT_END)]
-    print(f"\n{'Month':<12} {'Actual':>10} {'Fcast(EF=F)':>12} {'Fcast(EF=T)':>12}")
-    print("-" * 50)
-    for m in test_months.index:
-        actual_val = test_months[m]
-        ef_val = float(fc_ef.loc[m, "forecast"]) if (fc_ef is not None and m in fc_ef.index) else float("nan")
-        et_val = float(fc_et.loc[m, "forecast"]) if (fc_et is not None and m in fc_et.index) else float("nan")
-        print(f"  {str(m.date()):<12} {actual_val:>10.1f} {ef_val:>12.1f} {et_val:>12.1f}")
+    ensemble_configs = []
+    for cfg in ALL_CONFIGS:
+        label = f"enforce={cfg['enforce']}, method={cfg['method']}"
+        mape  = mape_map[label]
+        in_ens = (not np.isnan(mape)) and (mape - best_mape <= ENSEMBLE_TOLERANCE)
+        if in_ens:
+            ensemble_configs.append(cfg)
+        flag = "YES" if in_ens else "no"
+        mape_str = f"{mape:.3f}%" if not np.isnan(mape) else "N/A"
+        print(f"  {label:<35} {mape_str:>14}  {flag:>13}")
 
-    # Oct-2024 comparison
-    oct24 = pd.Timestamp("2024-10-01")
-    ef_oct = float(fc_ef.loc[oct24, "forecast"]) if (fc_ef is not None and oct24 in fc_ef.index) else float("nan")
-    et_oct = float(fc_et.loc[oct24, "forecast"]) if (fc_et is not None and oct24 in fc_et.index) else float("nan")
-    diff_pct = abs(ef_oct - et_oct) / max(abs(ef_oct), abs(et_oct)) * 100
-    print(f"\nOct-2024: enforce=False -> {ef_oct:.2f}, enforce=True -> {et_oct:.2f}, "
-          f"diff={diff_pct:.2f}% ({'> 3% UNSTABLE' if diff_pct > 3 else '<= 3% stable'})")
+    print(f"\n  Best holdout MAPE: {best_mape:.3f}%  |  Tolerance: {ENSEMBLE_TOLERANCE} pp")
+    print(f"  Ensemble members ({len(ensemble_configs)}):")
+    for cfg in ensemble_configs:
+        print(f"    enforce={cfg['enforce']}, method={cfg['method']}")
 
-    # Pick better enforce setting based on holdout MAPE
-    mape_ef = holdout_results.get("enforce=False, method=lbfgs", 999)
-    mape_et = holdout_results.get("enforce=True, method=lbfgs", 999)
-    if not np.isnan(mape_ef) and not np.isnan(mape_et):
-        best_enforce = mape_ef <= mape_et
-    else:
-        best_enforce = False
-    print(f"\nBest setting: enforce_stationarity=enforce_invertibility="
-          f"{'True' if best_enforce else 'False'} "
-          f"(lower holdout MAPE: {min(mape_ef, mape_et):.2f}%)")
-
-    # ---- Fit on FULL data with best setting ----
+    # ---- Step 2: Fit ensemble members on full data ----
     print("\n" + "=" * 70)
-    print("Fitting on full data...")
-    model_full = fit_model(
-        series, method="lbfgs",
-        enforce_stationarity=best_enforce,
-        enforce_invertibility=best_enforce,
-    )
-    fc_full = make_forecast(model_full, series.index[-1])
-    print(f"Forecast: {fc_full.index.min().date()} to {fc_full.index.max().date()}, "
-          f"n={len(fc_full)}")
+    print("Fitting ensemble members on full data...")
 
-    # ---- Stability check on full fit ----
-    print("\nFull-fit stability (Oct-2024 forecast across optimizers):")
-    oct24_vals = {}
-    for meth in ["lbfgs", "powell", "nm", "bfgs"]:
+    member_forecasts = []
+    for cfg in ensemble_configs:
+        label = f"enforce={cfg['enforce']}, method={cfg['method']}"
         try:
-            m2 = fit_model(series, method=meth,
-                           enforce_stationarity=best_enforce,
-                           enforce_invertibility=best_enforce)
-            fc2 = make_forecast(m2, series.index[-1])
-            v = float(fc2.loc[oct24, "forecast"]) if oct24 in fc2.index else float("nan")
-            oct24_vals[meth] = v
-            print(f"  method={meth:<8} -> Oct-2024 = {v:.2f}")
+            m = fit_model(series, method=cfg["method"], enforce=cfg["enforce"])
+            fc = make_forecast(m, series.index[-1])
+            member_forecasts.append({"label": label, "fc": fc})
+            oct24 = pd.Timestamp("2024-10-01")
+            v = float(fc.loc[oct24, "forecast"]) if oct24 in fc.index else float("nan")
+            print(f"  {label}: Oct-2024 = {v:.2f}")
         except Exception as e:
-            print(f"  method={meth}: failed ({e})")
+            print(f"  {label}: FAILED ({e})")
 
-    vals_ok = [v for v in oct24_vals.values() if not np.isnan(v)]
-    if len(vals_ok) > 1:
-        spread = max(vals_ok) - min(vals_ok)
-        spread_pct = spread / min(vals_ok) * 100
-        print(f"  Spread: {spread:.2f} MU ({spread_pct:.2f}%)")
+    if not member_forecasts:
+        print("ERROR: no ensemble members fitted. Aborting.")
+        return
 
-    # ---- Load saved forecast for comparison ----
+    # ---- Step 3: Compute ensemble mean ----
+    # Align all members on a common index
+    all_idx = member_forecasts[0]["fc"].index
+    for mf in member_forecasts[1:]:
+        all_idx = all_idx.intersection(mf["fc"].index)
+
+    fc_ensemble = pd.DataFrame(index=all_idx)
+    fc_ensemble["forecast"]    = np.mean(
+        [mf["fc"].loc[all_idx, "forecast"]    for mf in member_forecasts], axis=0)
+    fc_ensemble["ci_lower_95"] = np.mean(
+        [mf["fc"].loc[all_idx, "ci_lower_95"] for mf in member_forecasts], axis=0)
+    fc_ensemble["ci_upper_95"] = np.mean(
+        [mf["fc"].loc[all_idx, "ci_upper_95"] for mf in member_forecasts], axis=0)
+    # is_validated_horizon from first member (all members have same cutoff)
+    fc_ensemble["is_validated_horizon"] = member_forecasts[0]["fc"].loc[all_idx, "is_validated_horizon"]
+    fc_ensemble.index.name = "date"
+
+    # ---- Step 4: Print per-member and ensemble comparison ----
     print("\n" + "=" * 70)
-    print("Comparison: saved vs refit")
-    print(f"{'Date':<14} {'Saved fcast':>12} {'Refit fcast':>13} {'Diff':>8} {'Diff%':>7}")
-    print("-" * 60)
+    print("Per-member and ensemble forecasts:")
+    check_dates = [
+        pd.Timestamp("2024-10-01"),
+        pd.Timestamp("2025-10-01"),
+        pd.Timestamp("2030-12-01"),
+        pd.Timestamp("2040-12-01"),
+    ]
+
+    # Header
+    col_w = 15
+    hdr = f"  {'Date':<12}"
+    for mf in member_forecasts:
+        short = mf["label"].replace("enforce=", "enf=").replace(", method=", "/")
+        hdr += f" {short[:col_w]:>{col_w}}"
+    hdr += f" {'ENSEMBLE':>{col_w}} {'spread%':>8}"
+    print(hdr)
+    print("  " + "-" * (12 + col_w * (len(member_forecasts) + 1) + 10))
+
+    for cd in check_dates:
+        row = f"  {str(cd.date()):<12}"
+        vals = []
+        for mf in member_forecasts:
+            v = float(mf["fc"].loc[cd, "forecast"]) if cd in mf["fc"].index else float("nan")
+            vals.append(v)
+            row += f" {v:>{col_w}.2f}"
+        ens_v = float(fc_ensemble.loc[cd, "forecast"]) if cd in fc_ensemble.index else float("nan")
+        row += f" {ens_v:>{col_w}.2f}"
+        ok_vals = [v for v in vals if not np.isnan(v)]
+        spread_pct = (max(ok_vals) - min(ok_vals)) / ens_v * 100 if ok_vals and ens_v else float("nan")
+        row += f" {spread_pct:>7.2f}%"
+        print(row)
+
+    # ---- Step 5: Comparison with saved ----
+    print("\n" + "=" * 70)
+    print("Comparison: saved vs ensemble refit")
+    print(f"  {'Date':<12} {'Saved':>10} {'Refit':>10} {'Diff':>8} {'Diff%':>7} {'CI-width saved':>15} {'CI-width refit':>15}")
+    print("  " + "-" * 85)
     try:
         saved_fc = pd.read_excel(SAVED_FILE, index_col=0)
         saved_fc.index = pd.to_datetime(saved_fc.index)
     except Exception as e:
-        print(f"  Could not load saved forecast: {e}")
+        print(f"  Could not load saved: {e}")
         saved_fc = None
 
     for cd in COMPARISON_DATES:
-        s_val = (
-            float(saved_fc.loc[cd, "forecast"])
-            if (saved_fc is not None and cd in saved_fc.index)
-            else float("nan")
-        )
-        r_val = (
-            float(fc_full.loc[cd, "forecast"])
-            if cd in fc_full.index
-            else float("nan")
-        )
-        diff     = r_val - s_val if not (np.isnan(s_val) or np.isnan(r_val)) else float("nan")
-        diff_pct2 = diff / s_val * 100 if not np.isnan(diff) and s_val != 0 else float("nan")
-        s_str  = f"{s_val:,.2f}"  if not np.isnan(s_val)   else "N/A"
-        r_str  = f"{r_val:,.2f}"  if not np.isnan(r_val)   else "N/A"
-        d_str  = f"{diff:+,.2f}"  if not np.isnan(diff)     else "N/A"
-        dp_str = f"{diff_pct2:+.2f}%" if not np.isnan(diff_pct2) else "N/A"
-        print(f"  {str(cd.date()):<14} {s_str:>12} {r_str:>13} {d_str:>8} {dp_str:>7}")
+        s_v = float(saved_fc.loc[cd, "forecast"]) if (saved_fc is not None and cd in saved_fc.index) else float("nan")
+        r_v = float(fc_ensemble.loc[cd, "forecast"]) if cd in fc_ensemble.index else float("nan")
+        diff = r_v - s_v if not (np.isnan(s_v) or np.isnan(r_v)) else float("nan")
+        dpct = diff / s_v * 100 if not np.isnan(diff) and s_v != 0 else float("nan")
+        s_ci = (float(saved_fc.loc[cd, "ci_upper_95"]) - float(saved_fc.loc[cd, "ci_lower_95"])) \
+               if (saved_fc is not None and cd in saved_fc.index) else float("nan")
+        r_ci = float(fc_ensemble.loc[cd, "ci_upper_95"]) - float(fc_ensemble.loc[cd, "ci_lower_95"]) \
+               if cd in fc_ensemble.index else float("nan")
+        print(f"  {str(cd.date()):<12} {s_v:>10.2f} {r_v:>10.2f} {diff:>+8.2f} {dpct:>+6.1f}% "
+              f"{s_ci:>15.2f} {r_ci:>15.2f}")
 
     # ---- Write output ----
     print(f"\nWriting {OUTPUT_FILE} ...")
-    fc_full.to_excel(OUTPUT_FILE)
-    print("Done.")
-
-    # Verify it doesn't overwrite the saved file
-    assert OUTPUT_FILE.resolve() != SAVED_FILE.resolve(), (
-        "BUG: would have overwritten the original forecast file!"
-    )
-    print(f"Verified: output is a NEW file ({OUTPUT_FILE.name}), "
-          f"original ({SAVED_FILE.name}) unchanged.")
-
-    print("\n" + "=" * 70)
-    print("IMPORTANT: To use the refit forecast in the dashboard, update")
-    print("  DEMAND_FORECAST_FILE in dashboard.py to point to:")
-    print(f"  {OUTPUT_FILE.name}")
-    print("Or copy avg_daily_demand_forecast_2040_refit.xlsx over the")
-    print("original ONLY after verifying the numbers are acceptable.")
-    print("=" * 70)
+    fc_ensemble.to_excel(OUTPUT_FILE)
+    assert OUTPUT_FILE.resolve() != SAVED_FILE.resolve(), \
+        "BUG: would overwrite original!"
+    print(f"Done. Rows={len(fc_ensemble)}, "
+          f"first={fc_ensemble.index.min().date()}, "
+          f"last={fc_ensemble.index.max().date()}")
+    print(f"Original {SAVED_FILE.name} first-row forecast: "
+          f"{float(saved_fc.iloc[0]['forecast']):.5f} (unchanged check)")
 
 
 if __name__ == "__main__":
