@@ -13,7 +13,7 @@ Models compared:
   - Holt-Winters Exponential Smoothing (additive seasonal)
   - ARIMA
   - SARIMA
-  - Prophet (skipped gracefully if not installed)
+ 
 
 Metrics: MAE, RMSE, MAPE — aggregated across all walk-forward folds.
 

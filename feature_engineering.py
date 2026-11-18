@@ -57,7 +57,7 @@ def handle_low_coverage(df):
         if col not in df.columns:
             continue
         df.loc[df["low_coverage_flag"], col] = np.nan
-        df[col] = df[col].interpolate(method="linear", limit_direction="both")
+        df[col] = df[col].interpolate(method="linear", limit_area="inside")
 
     return df
 
