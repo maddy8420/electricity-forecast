@@ -149,17 +149,26 @@ if not data_loaded:
     st.stop()
 
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "Historical Trends", "Source Mix", "Forecast to 2040",
-    "Demand-Supply Gap", "Mix Builder", "Date Predictor",
-])
+section = st.radio(
+    "Section",
+    [
+        "Historical Trends",
+        "Source Mix",
+        "Forecast to 2040",
+        "Demand-Supply Gap",
+        "Mix Builder",
+        "Date Predictor",
+    ],
+    horizontal=True,
+    label_visibility="collapsed",
+)
 
 
 # ----------------------------------------------------------------------
 # TAB 1 — Historical Trends
 # ----------------------------------------------------------------------
 
-with tab1:
+if section == "Historical Trends":
     st.subheader("Generation, Demand & Consumption — Historical (2013-2024)")
 
     metric = st.selectbox(
@@ -182,8 +191,8 @@ with tab1:
     fig.add_vline(x=ERA_CUTOFF, line_dash="dash", line_color="red",
                    annotation_text="CEA reporting-format change")
 
-    fig.update_layout(height=500, xaxis_title="Date", yaxis_title=metric)
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(height=520, margin=dict(t=40), xaxis_title="Date", yaxis_title=metric)
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": False})
 
     st.caption(
         "Orange X markers show months that were interpolated due to severe "
@@ -196,7 +205,7 @@ with tab1:
 # TAB 2 — Source Mix
 # ----------------------------------------------------------------------
 
-with tab2:
+if section == "Source Mix":
     st.subheader("Generation Source Mix — % Share (Dec 2018 onward)")
     st.caption(
         "Scoped to Dec 2018+ because Coal/Lignite itemization is unreliable "
@@ -212,13 +221,88 @@ with tab2:
     monthly.index = monthly.index.to_timestamp()
     share = monthly.div(monthly.sum(axis=1), axis=0) * 100
 
-    fig = go.Figure()
-    for col in share.columns:
-        fig.add_trace(go.Scatter(
-            x=share.index, y=share[col], mode="lines", stackgroup="one", name=col
+    source_colors = {
+        "coal_lignite_mu": "#1f77b4",
+        "renewables_mu": "#90c2e7",
+        "hydro_mu": "#ff6666",
+        "nuclear_mu": "#ffb3b3",
+        "gas_naptha_diesel_mu": "#5ed6c0",
+    }
+
+    # day counts per month (from harmonized daily rows, same reliable_start scope)
+    detailed["_ym_ts"] = detailed["year_month"].dt.to_timestamp()
+    days_per_month = detailed.groupby("_ym_ts").size()
+
+    # complete calendar years: all 12 months present and starting no earlier
+    # than the first month in the monthly dropdown
+    src_cols = ["coal_lignite_mu", "renewables_mu", "hydro_mu", "nuclear_mu", "gas_naptha_diesel_mu"]
+    monthly_mu = detailed.groupby("_ym_ts")[src_cols].sum()
+    months_per_year = monthly_mu.groupby(monthly_mu.index.year).size()
+    complete_years = [y for y in months_per_year.index if months_per_year[y] == 12]
+
+    tab_m, tab_y = st.tabs(["Monthly", "Yearly"])
+
+    with tab_m:
+        # default to latest month with >= 20 reported days
+        good_months = days_per_month[days_per_month >= 20].index
+        default_m_ts = good_months[-1] if len(good_months) else monthly_mu.index[-1]
+        month_labels = monthly_mu.index.strftime("%b %Y")
+        default_m_idx = list(monthly_mu.index).index(default_m_ts)
+        selected_month = st.selectbox(
+            "Month", options=month_labels, index=default_m_idx, key="mix_month"
+        )
+        sel_ts = monthly_mu.index[list(month_labels).index(selected_month)]
+        sel_mu = monthly_mu.loc[sel_ts]
+        sel_share = sel_mu / sel_mu.sum() * 100
+        n_days_m = int(days_per_month.get(sel_ts, 0))
+
+        fig_m = go.Figure(go.Pie(
+            labels=sel_share.index,
+            values=sel_share.values,
+            marker=dict(colors=[source_colors[col] for col in sel_share.index]),
+            sort=False, direction="clockwise",
+            textinfo="label+percent",
+            texttemplate="%{label}<br>%{percent}",
+            hovertemplate="%{label}: %{value:.1f}%<extra></extra>",
         ))
-    fig.update_layout(height=550, yaxis_title="% share", xaxis_title="Date")
-    st.plotly_chart(fig, use_container_width=True)
+        fig_m.update_layout(
+            height=550,
+            title=f"Generation Source Mix - {selected_month}",
+            legend=dict(orientation="h", yanchor="bottom", y=-0.12, xanchor="center", x=0.5),
+        )
+        st.plotly_chart(fig_m, use_container_width=True)
+        caution = " (few days, treat with caution)" if n_days_m < 20 else ""
+        st.caption(f"Based on {n_days_m} reported days{caution}")
+
+    with tab_y:
+        if not complete_years:
+            st.info("No complete calendar years available in this date range.")
+        else:
+            year_labels = [str(y) for y in complete_years]
+            selected_year = st.selectbox(
+                "Year", options=year_labels, index=len(year_labels) - 1, key="mix_year"
+            )
+            yr = int(selected_year)
+            yr_mu = monthly_mu[monthly_mu.index.year == yr].sum()
+            yr_share = yr_mu / yr_mu.sum() * 100
+            n_days_y = int(days_per_month[days_per_month.index.year == yr].sum())
+
+            fig_y = go.Figure(go.Pie(
+                labels=yr_share.index,
+                values=yr_share.values,
+                marker=dict(colors=[source_colors[col] for col in yr_share.index]),
+                sort=False, direction="clockwise",
+                textinfo="label+percent",
+                texttemplate="%{label}<br>%{percent}",
+                hovertemplate="%{label}: %{value:.1f}%<extra></extra>",
+            ))
+            fig_y.update_layout(
+                height=550,
+                title=f"Generation Source Mix - {selected_year}",
+                legend=dict(orientation="h", yanchor="bottom", y=-0.12, xanchor="center", x=0.5),
+            )
+            st.plotly_chart(fig_y, use_container_width=True)
+            st.caption(f"Based on {n_days_y} reported days")
 
     col1, col2 = st.columns(2)
     col1.metric("Renewables share (first month)", f"{share['renewables_mu'].iloc[0]:.1f}%")
@@ -229,36 +313,108 @@ with tab2:
 # TAB 3 — Forecast to 2040
 # ----------------------------------------------------------------------
 
-with tab3:
+if section == "Forecast to 2040":
     st.subheader("Demand & Generation Forecast to 2040")
-    st.caption(
-        "Only the first 24 months of forecast are empirically validated "
-        "via walk-forward testing. Everything beyond that (shaded lighter) "
-        "is a trend-based scenario extrapolation, not a precise prediction."
+    view = st.radio(
+        "View",
+        ["Yearly average", "Monthly"],
+        horizontal=True,
     )
+    show_uncertainty = st.checkbox("Show 95% uncertainty range", value=False)
+
+    def yearly_complete(df):
+        rows = []
+        for year, part in df.groupby(df.index.year):
+            if len(part) != 12:
+                continue
+            rows.append({
+                "date": pd.Timestamp(f"{year}-12-01"),
+                "forecast": part["forecast"].mean(),
+                "ci_lower_95": part["ci_lower_95"].mean(),
+                "ci_upper_95": part["ci_upper_95"].mean(),
+                "is_validated_horizon": bool(part["is_validated_horizon"].all()),
+            })
+        return pd.DataFrame(rows).set_index("date")
+
+    series = {}
+    for name, df, color in [
+        ("Demand", demand_fc, "#FF6B6B"),
+        ("Generation", generation_fc, "#4DA3FF"),
+    ]:
+        chart_df = yearly_complete(df) if view == "Yearly average" else df
+        series[name] = (chart_df, color)
 
     fig = go.Figure()
-    for name, df, color in [("Demand", demand_fc, "red"), ("Generation", generation_fc, "blue")]:
-        validated = df[df["is_validated_horizon"]]
-        extrapolated = df[~df["is_validated_horizon"]]
+    hovertemplate = (
+        "%{x|%Y}: %{y:,.0f} MU/day"
+        if view == "Yearly average"
+        else "%{x|%b %Y}: %{y:,.0f} MU/day"
+    )
+
+    for name, (chart_df, color) in series.items():
+        validated = chart_df[chart_df["is_validated_horizon"]]
+        extrapolated = chart_df[~chart_df["is_validated_horizon"]]
 
         fig.add_trace(go.Scatter(
-            x=validated.index, y=validated["forecast"], mode="lines",
-            name=f"{name} (validated)", line=dict(color=color)
-        ))
-        fig.add_trace(go.Scatter(
-            x=extrapolated.index, y=extrapolated["forecast"], mode="lines",
-            name=f"{name} (extrapolated)", line=dict(color=color, dash="dash")
-        ))
-        fig.add_trace(go.Scatter(
-            x=list(df.index) + list(df.index[::-1]),
-            y=list(df["ci_upper_95"]) + list(df["ci_lower_95"][::-1]),
-            fill="toself", fillcolor=color, opacity=0.1,
-            line=dict(width=0), showlegend=False, hoverinfo="skip"
+            x=validated.index,
+            y=validated["forecast"],
+            mode="lines",
+            name=name,
+            legendgroup=name,
+            line=dict(color=color, width=3),
+            hovertemplate=hovertemplate + "<extra></extra>",
         ))
 
-    fig.update_layout(height=600, xaxis_title="Date", yaxis_title="Avg Daily (MU)")
+        dashed_df = extrapolated
+        if len(validated) and len(extrapolated):
+            boundary = validated.iloc[[-1]]
+            dashed_df = pd.concat([boundary, extrapolated])
+        fig.add_trace(go.Scatter(
+            x=dashed_df.index,
+            y=dashed_df["forecast"],
+            mode="lines",
+            name=name,
+            legendgroup=name,
+            showlegend=False,
+            line=dict(color=color, width=3, dash="dash"),
+            hovertemplate=hovertemplate + "<extra></extra>",
+        ))
+
+        if show_uncertainty:
+            fig.add_trace(go.Scatter(
+                x=list(chart_df.index) + list(chart_df.index[::-1]),
+                y=list(chart_df["ci_upper_95"]) + list(chart_df["ci_lower_95"][::-1]),
+                fill="toself",
+                fillcolor=hex_to_rgba(color, 0.10),
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+
+        last = chart_df.iloc[-1]
+        annotation_y_offset = -30 if name == "Demand" else 30
+        fig.add_annotation(
+            x=chart_df.index[-1],
+            y=last["forecast"],
+            text=f"{name} 2040: {last['forecast']:,.0f}",
+            showarrow=False,
+            xanchor="left",
+            xshift=8,
+            yshift=annotation_y_offset,
+            font=dict(color=color, size=12),
+        )
+
+    fig.update_layout(
+        height=600,
+        xaxis_title="Date",
+        yaxis_title="Average daily energy (MU/day)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
     st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Solid = validated horizon (first 24 months of each forecast); "
+        "dashed = extrapolation, indicative only."
+    )
 
     st.subheader("Checkpoint Forecasts")
     rows = []
@@ -273,13 +429,17 @@ with tab3:
                 "Generation 95% CI": f"[{generation_fc.loc[target, 'ci_lower_95']:,.0f}, {generation_fc.loc[target, 'ci_upper_95']:,.0f}]",
             })
     st.table(pd.DataFrame(rows).set_index("Year"))
+    if view == "Yearly average":
+        st.caption(
+            "The checkpoint table uses December values, not the 12-month yearly averages."
+        )
 
 
 # ----------------------------------------------------------------------
 # TAB 4 — Demand-Supply Gap (with scenario slider)
 # ----------------------------------------------------------------------
 
-with tab4:
+if section == "Demand-Supply Gap":
     st.subheader("Demand-Supply Gap, with Adjustable Generation Growth Scenario")
 
     st.warning(
@@ -292,6 +452,7 @@ with tab4:
     growth_adjustment = st.slider(
         "Adjust generation growth assumption (illustrative scenario, %/year)",
         min_value=-5.0, max_value=5.0, value=0.0, step=0.5,
+        key="gap_slider",
         help="Applies a simple compounding adjustment to the generation "
              "forecast to illustrate 'what if generation grew faster/slower "
              "than the trend model assumes' — e.g. from accelerated renewable "
@@ -342,7 +503,7 @@ with tab4:
 # TAB 5 — Mix Builder (pick sources, see history + forecast to 2040)
 # ----------------------------------------------------------------------
 
-with tab5:
+if section == "Mix Builder":
     st.subheader("Energy Mix Builder")
 
     if source_hist is None:
@@ -475,7 +636,7 @@ with tab5:
 # TAB 6 — Date Predictor
 # ----------------------------------------------------------------------
 
-with tab6:
+if section == "Date Predictor":
     st.subheader("Date Predictor — Expected National Electricity Demand")
     st.caption(
         "Pick any date between April 2013 and December 2040. "
