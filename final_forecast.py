@@ -1,21 +1,4 @@
-"""
-Final Long-Horizon Forecast — to 2040
---------------------------------------------------
-Uses the validated SARIMA(1,1,2)x(0,1,1,12) order (selected via AIC grid
-search) to forecast the chosen TARGET_COL from the end of the data through
-Dec 2040, with 95% confidence intervals.
-
-IMPORTANT FRAMING (see printed notes and chart): only horizons up to
-~24 months were empirically validated via walk-forward testing. Anything
-beyond that — which is most of this forecast, since the target year is
-2040 — should be presented as a trend-based scenario projection, not a
-precise prediction. The confidence intervals will visibly widen with
-horizon; this is the model correctly expressing its own growing
-uncertainty, not a bug.
-
-Change TARGET_COL below to run this against demand, generation, or
-consumption — filenames and chart titles adapt automatically.
-"""
+"""Generate long-horizon electricity forecasts. Run with: python final_forecast.py."""
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -126,10 +109,7 @@ def main():
     print(f"Fitting SARIMA{BEST_ORDER}x{BEST_SEASONAL_ORDER} on {len(series)} months "
           f"of history ({series.index.min().date()} to {series.index.max().date()})...\n")
 
-    # Stability check: fit with a couple of different optimizers and compare
-    # the 2040 point forecast. If these disagree substantially, it confirms
-    # the fit is sensitive to optimization path — important to know and
-    # disclose before treating any single run's numbers as final.
+    # Compare optimizer fits because disagreement indicates sensitivity to optimization path.
     print("Stability check — fitting with multiple optimizers to check "
           "how sensitive the result is to the optimization path...\n")
     stability_results = {}

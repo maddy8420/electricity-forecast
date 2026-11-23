@@ -1,22 +1,4 @@
-"""
-CEA Benchmark Comparison
-----------------------------
-Compares this project's SARIMA trend-based demand forecast against India's
-own official demand projections, published by the Central Electricity
-Authority (CEA) via the 20th Electric Power Survey (EPS) and subsequent
-planning documents.
-
-Official figures (energy requirement in Billion Units, BU) are hardcoded
-below with their source citations — these are published government figures,
-not scraped/API data, so they're recorded directly rather than fetched.
-
-Sources:
-  - CEA National Electricity Plan (Vol-I Generation), 2022-32, per 20th EPS
-    projections. Notified via PIB press release, PRID=1928750.
-  - CEA Long-Term National Resource Adequacy Plan (LT-NRAP) 2026-27 to
-    2035-36, released ~April 2026, reflecting the mid-term review of the
-    20th EPS (revised upward from the original NEP 2022-32 figures).
-"""
+"""Compare the demand forecast with official CEA projections. Run with: python cea_benchmark.py."""
 
 import pandas as pd
 from pathlib import Path
@@ -52,8 +34,7 @@ CEA_BENCHMARKS = [
     },
 ]
 
-# CEA's own stated CAGR for total energy requirement, 2024-25 to 2035-36,
-# per the LT-NRAP mid-term review — cited directly, not recomputed.
+# CEA's stated CAGR is cited directly rather than recomputed.
 CEA_STATED_CAGR_PCT = 6.41
 
 
@@ -97,7 +78,6 @@ def main():
 
     results_df = pd.DataFrame(rows)
 
-    # Implied CAGR from my model vs CEA's own stated CAGR
     first_val = my_forecast.loc["2026-12-01", "forecast"]
     last_val = my_forecast.loc["2035-12-01", "forecast"]
     years = 2035 - 2026
@@ -120,7 +100,6 @@ def main():
     print("accelerates as officially planned — the true demand trajectory may sit")
     print("meaningfully above this project's pure-trend extrapolation.")
 
-    # Plot
     fig, ax = plt.subplots(figsize=(11, 6))
     years_list = [2026, 2032, 2035]
     my_vals = results_df["my_forecast_bu"].tolist()

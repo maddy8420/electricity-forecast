@@ -1,17 +1,4 @@
-"""
-SARIMA Order Selection — Small Grid Search
-------------------------------------------------
-The (1,1,1)x(1,1,1,12) order used so far was a reasonable starting guess,
-not a validated choice — and it threw convergence warnings. This does a
-small grid search over plausible orders, scored by AIC (a standard
-model-selection criterion that penalizes unnecessary complexity), and
-reports the best one to actually use for the final forecast.
-
-Kept deliberately small (candidates chosen from typical ranges for
-monthly economic/demand series) rather than an exhaustive search, since
-an exhaustive grid over a small dataset risks overfitting the order
-selection itself.
-"""
+"""Search SARIMA model orders. Run with: python sarima_order_search.py."""
 
 import warnings
 warnings.filterwarnings("ignore")

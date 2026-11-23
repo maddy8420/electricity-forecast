@@ -1,13 +1,4 @@
-"""
-Multi-Horizon Walk-Forward Validation
-------------------------------------------
-The single-step (1-month-ahead) comparison in forecast_models.py doesn't
-tell us which model will actually hold up for a 2026-2040 forecast — some
-models (Naive) are only ever accurate 1 step ahead and become useless
-further out. This script tests each model at HORIZONS = [1, 3, 6, 12, 24]
-months ahead, which is what actually justifies a model choice for
-long-range forecasting.
-"""
+"""Validate forecasting models across multiple horizons. Run with: python forecast_multihorizon.py."""
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -36,8 +27,7 @@ def load_series():
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").set_index("date")
     series = df[TARGET_COL].dropna()
-    # Explicitly set monthly-start frequency — fixes the ValueWarning and
-    # is required for reliable out-of-sample date-based forecasting later.
+    # Set monthly-start frequency for reliable date-based out-of-sample forecasts.
     series = series.asfreq("MS")
     series = series.interpolate(method="linear")  # in case asfreq introduced any new gaps
     return series
@@ -56,11 +46,6 @@ def rmse(actual, predicted):
 def mae(actual, predicted):
     return np.mean(np.abs(np.array(actual) - np.array(predicted)))
 
-
-# ----------------------------------------------------------------------
-# FORECASTERS — each takes a training series + horizon, returns an array
-# of `horizon` forecasted values
-# ----------------------------------------------------------------------
 
 def forecast_naive(train, horizon):
     return np.repeat(train.iloc[-1], horizon)
@@ -107,14 +92,7 @@ MODELS = {
 
 
 def evaluate_at_horizon(series, horizon):
-    """
-    For a given horizon, pick N_TEST_ORIGINS different points in the
-    series, forecast `horizon` steps ahead from each, and compare to what
-    actually happened. Returns MAE/RMSE/MAPE per model, averaged across
-    origins (each origin contributes its horizon-step-ahead error, not
-    every intermediate step, to keep this focused on "how good is the
-    forecast AT that horizon", not an average across 1..horizon).
-    """
+    """Evaluate a forecasting model at one horizon across multiple test origins."""
     n = len(series)
     latest_possible_origin = n - horizon
     earliest_origin = MIN_TRAIN_SIZE
@@ -175,8 +153,7 @@ def main():
     pivot = pivot[HORIZONS]  # keep column order
     print(pivot.round(2).to_string())
 
-    # Plot MAPE vs horizon per model — this is the chart that actually
-    # answers "which model should I trust for a 15-year-ahead forecast"
+    # Compare MAPE by horizon to assess long-range model reliability.
     fig, ax = plt.subplots(figsize=(9, 6))
     for model in pivot.index:
         ax.plot(HORIZONS, pivot.loc[model], marker="o", label=model)

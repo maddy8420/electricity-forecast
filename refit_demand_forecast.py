@@ -1,22 +1,4 @@
-"""
-refit_demand_forecast.py  (Phase C — ensemble rewrite)
---------------------------------------------------------
-Re-fits SARIMAX(1,1,2)x(0,1,1,12) on avg_daily_consumption exactly as
-final_forecast.py does (same preprocessing, same order/options).
-
-Selection:  Holdout MAPE over 2023-10..2024-09 ranks all four
-            (enforce, method) configurations. Configurations whose
-            holdout MAPE is within ENSEMBLE_TOLERANCE pp of the best
-            are included in the ensemble.
-
-Ensemble:   Fit each member on the FULL series. Forecast = mean of
-            member point forecasts; CI bounds = mean of each member's
-            CI bound (not a wider joint interval).  Same schema and
-            is_validated_horizon flag as the original file.
-
-Output (NEW file — does NOT overwrite original):
-    avg_daily_demand_forecast_2040_refit.xlsx
-"""
+"""Refit the demand forecast ensemble. Run with: python refit_demand_forecast.py."""
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -26,9 +8,6 @@ import numpy as np
 from pathlib import Path
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-# ---------------------------------------------------------------------------
-# Constants — same as final_forecast.py
-# ---------------------------------------------------------------------------
 BASE_DIR       = Path(__file__).resolve().parent
 INPUT_FILE     = BASE_DIR / "india_electricity_features.xlsx"
 OUTPUT_FILE    = BASE_DIR / "avg_daily_demand_forecast_2040_refit.xlsx"
@@ -60,9 +39,6 @@ ALL_CONFIGS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Preprocessing — identical to final_forecast.py load_series()
-# ---------------------------------------------------------------------------
 def load_series() -> pd.Series:
     df = pd.read_excel(INPUT_FILE, sheet_name="features")
     df["date"] = pd.to_datetime(df["date"])
@@ -116,9 +92,6 @@ def holdout_mape(series: pd.Series, method: str, enforce: bool) -> dict:
     return {"mape": mape}
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
     print("=" * 70)
     print("refit_demand_forecast.py  [ensemble]")
@@ -131,7 +104,6 @@ def main():
         f"n={len(series)}\n"
     )
 
-    # ---- Step 1: Holdout evaluation of all 4 configs ----
     print("Holdout evaluation (train < 2023-10, test 2023-10..2024-09):")
     print(f"  {'Config':<35} {'Holdout MAPE':>14}  {'In ensemble?':>13}")
     print("  " + "-" * 65)
@@ -144,6 +116,7 @@ def main():
 
     best_mape = min(v for v in mape_map.values() if not np.isnan(v))
 
+    # Select ensemble members by holdout MAPE within the configured tolerance.
     ensemble_configs = []
     for cfg in ALL_CONFIGS:
         label = f"enforce={cfg['enforce']}, method={cfg['method']}"
@@ -160,7 +133,6 @@ def main():
     for cfg in ensemble_configs:
         print(f"    enforce={cfg['enforce']}, method={cfg['method']}")
 
-    # ---- Step 2: Fit ensemble members on full data ----
     print("\n" + "=" * 70)
     print("Fitting ensemble members on full data...")
 
@@ -181,8 +153,6 @@ def main():
         print("ERROR: no ensemble members fitted. Aborting.")
         return
 
-    # ---- Step 3: Compute ensemble mean ----
-    # Align all members on a common index
     all_idx = member_forecasts[0]["fc"].index
     for mf in member_forecasts[1:]:
         all_idx = all_idx.intersection(mf["fc"].index)
@@ -198,7 +168,6 @@ def main():
     fc_ensemble["is_validated_horizon"] = member_forecasts[0]["fc"].loc[all_idx, "is_validated_horizon"]
     fc_ensemble.index.name = "date"
 
-    # ---- Step 4: Print per-member and ensemble comparison ----
     print("\n" + "=" * 70)
     print("Per-member and ensemble forecasts:")
     check_dates = [
@@ -208,7 +177,6 @@ def main():
         pd.Timestamp("2040-12-01"),
     ]
 
-    # Header
     col_w = 15
     hdr = f"  {'Date':<12}"
     for mf in member_forecasts:
@@ -232,7 +200,6 @@ def main():
         row += f" {spread_pct:>7.2f}%"
         print(row)
 
-    # ---- Step 5: Comparison with saved ----
     print("\n" + "=" * 70)
     print("Comparison: saved vs ensemble refit")
     print(f"  {'Date':<12} {'Saved':>10} {'Refit':>10} {'Diff':>8} {'Diff%':>7} {'CI-width saved':>15} {'CI-width refit':>15}")
@@ -256,7 +223,6 @@ def main():
         print(f"  {str(cd.date()):<12} {s_v:>10.2f} {r_v:>10.2f} {diff:>+8.2f} {dpct:>+6.1f}% "
               f"{s_ci:>15.2f} {r_ci:>15.2f}")
 
-    # ---- Write output ----
     print(f"\nWriting {OUTPUT_FILE} ...")
     fc_ensemble.to_excel(OUTPUT_FILE)
     assert OUTPUT_FILE.resolve() != SAVED_FILE.resolve(), \

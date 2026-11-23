@@ -1,25 +1,4 @@
-"""
-Forecasting Model Comparison — Walk-Forward Validation
-----------------------------------------------------------
-Evaluates multiple forecasting approaches on a single target series using
-walk-forward (expanding window, 1-month-ahead) validation, which is far
-more honest than a single train/test split — it tests the model across
-many different points in time, not just one.
-
-Models compared:
-  - Naive (last value)
-  - Seasonal Naive (same month, prior year)
-  - Moving Average (3-month)
-  - Holt-Winters Exponential Smoothing (additive seasonal)
-  - ARIMA
-  - SARIMA
- 
-
-Metrics: MAE, RMSE, MAPE — aggregated across all walk-forward folds.
-
-Change TARGET_COL below to run this against generation or consumption
-instead of demand.
-"""
+"""Compare electricity forecasting models. Run with: python forecast_models.py."""
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -64,9 +43,6 @@ def mae(actual, predicted):
     return np.mean(np.abs(np.array(actual) - np.array(predicted)))
 
 
-# ----------------------------------------------------------------------
-# FORECASTERS — each takes a training series, returns a 1-step forecast
-# ----------------------------------------------------------------------
 
 def forecast_naive(train):
     return train.iloc[-1]

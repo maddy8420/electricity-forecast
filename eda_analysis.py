@@ -1,22 +1,7 @@
-"""
-India Electricity EDA
-------------------------
-Reads india_electricity_master.xlsx and produces:
-  - Summary stats / missing-value check
-  - Trend & seasonality decomposition (generation + demand)
-  - Year-over-year growth rates (low-coverage months excluded)
-  - A reporting-era boundary check (2017-05-26) so real growth isn't
-    confused with a data-collection artifact
-  - Source-mix evolution chart (Dec 2018 onward — see note below)
-  - Demand vs temperature correlation
-  - Peak vs average demand gap over time (partial years excluded)
-
-All charts saved as PNGs in ./figures/
-"""
+"""Analyze electricity data and trends. Run with: python eda_analysis.py."""
 
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from statsmodels.tsa.seasonal import seasonal_decompose
 from pathlib import Path
 
@@ -94,10 +79,6 @@ def yoy_growth(master):
     print("3. YEAR-OVER-YEAR GROWTH")
     print("=" * 70)
 
-    # Exclude low-coverage months from growth calculations — a month with
-    # <20 days reported produces a fake spike/crash in YoY comparisons
-    # (confirmed cause: e.g. Dec 2022 had only 4 days reported, making
-    # Dec 2023 look like +600% growth when nothing unusual happened).
     df = master.set_index("date").sort_index()
     if "low_coverage_flag" in df.columns:
         n_excluded = int(df["low_coverage_flag"].sum())
@@ -136,10 +117,7 @@ def source_mix_evolution(harmonized):
     print("4. SOURCE-MIX EVOLUTION (Dec 2018 onward — see below)")
     print("=" * 70)
 
-    # Start from Dec 2018, not May 2017: Coal/Lignite itemization only
-    # becomes reliable from 2018-11-29 onward (confirmed via check_date_ranges).
-    # Using May 2017 as a starting point inflates renewables' apparent share,
-    # since coal was NaN (treated as 0 in the sum) for nearly that entire month.
+    # Start in Dec 2018 because coal itemization is reliable only from then.
     reliable_start = pd.Timestamp("2018-12-01")
     detailed = harmonized[harmonized["date"] >= reliable_start].copy()
     detailed["year_month"] = detailed["date"].dt.to_period("M")
@@ -208,10 +186,6 @@ def peak_vs_average_gap(hourly):
     )
     hourly["year"] = hourly["date"].dt.year
 
-    # Flag partial years (fewer than ~350 days) so they aren't compared
-    # directly against full years — e.g. 2024 may only have data through
-    # April/May, which would skew the average toward whichever season
-    # happens to be covered.
     days_per_year = hourly.groupby("year").size()
     partial_years = days_per_year[days_per_year < 350].index.tolist()
     if partial_years:

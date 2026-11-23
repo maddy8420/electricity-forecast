@@ -1,49 +1,16 @@
-"""
-India Electricity Data Pipeline
---------------------------------
-Pulls historical electricity data from:
-  1. CEA (Central Electricity Authority) open API — no key needed
-  2. data.gov.in Open Government Data API — free key needed (see below)
-
-Saves everything into one Excel workbook, one sheet per dataset.
-
-SETUP BEFORE RUNNING
-=====================
-1. CEA endpoints below are open (no key), but CEA's server is slow/flaky —
-   this script retries and times out gracefully rather than hanging forever.
-
-2. For data.gov.in:
-   - Go to https://data.gov.in, create a free account
-   - Go to "My Account" -> "API Key" to get your key (does not expire)
-   - Search the catalog for the specific electricity dataset you want
-     (e.g. "per capita electricity consumption", "all india installed
-     capacity"). Each dataset's API page gives you its RESOURCE_ID.
-   - Paste your key + the resource IDs you find into DATAGOVIN_CONFIG below.
-     Leave a resource_id blank / remove the entry to skip it — this script
-     will just skip datasets that aren't configured instead of failing.
-
-Run:
-    python data_pipeline.py
-Output:
-    india_electricity_data.xlsx  (in the same folder)
-"""
+"""Fetch and combine electricity datasets. Run with: python diagnostics/data_pipeline.py."""
 
 import time
 import requests
 import pandas as pd
 from datetime import datetime
 
-# ----------------------------------------------------------------------
-# CONFIG — fill these in
-# ----------------------------------------------------------------------
 
 DATAGOVIN_API_KEY = "PASTE_YOUR_DATA_GOV_IN_KEY_HERE"
 
 # Add resource IDs here as you find them on data.gov.in.
 # Format: "sheet_name": "resource_id"
 DATAGOVIN_CONFIG = {
-    # "per_capita_consumption": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-    # "state_wise_generation": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
 }
 
 # CEA open endpoints — documented at
@@ -69,9 +36,6 @@ MAX_RETRIES = 2
 RETRY_DELAY = 3        # seconds between retries
 
 
-# ----------------------------------------------------------------------
-# FETCH HELPERS
-# ----------------------------------------------------------------------
 
 def fetch_json(url, params=None, label=""):
     """Fetch a URL and return parsed JSON, with retries. Returns None on failure."""
@@ -95,11 +59,9 @@ def json_to_dataframe(data):
     if isinstance(data, list):
         return pd.DataFrame(data)
     if isinstance(data, dict):
-        # Common patterns: {"records": [...]}  or a single dict of arrays
         for key in ("records", "data", "result"):
             if key in data and isinstance(data[key], list):
                 return pd.DataFrame(data[key])
-        # Fallback: try flattening whatever's there
         try:
             return pd.json_normalize(data)
         except Exception:
@@ -165,7 +127,6 @@ def save_to_excel(all_data, output_file):
             safe_name = sheet_name[:31]
             df.to_excel(writer, sheet_name=safe_name, index=False)
 
-        # A small metadata sheet so you know when this was pulled
         meta = pd.DataFrame({
             "pulled_at": [datetime.now().isoformat()],
             "sheets": [", ".join(all_data.keys())],
@@ -175,9 +136,6 @@ def save_to_excel(all_data, output_file):
     print(f"\nSaved {len(all_data)} sheet(s) to {output_file}")
 
 
-# ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
 
 def main():
     all_data = {}

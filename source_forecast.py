@@ -1,22 +1,4 @@
-"""
-Per-Source Forecasts to 2040
---------------------------------
-Forecasts each generation source separately (coal & lignite, renewables,
-hydro, nuclear, gas) so the dashboard's Mix Builder tab can let a user
-pick which sources to include.
-
-Caveats (also shown in the dashboard):
-  - Per-source history only becomes reliable from Dec 2018 (see
-    data_integrity_and_findings.md), and the source file ends Mar 2023,
-    so each model sees roughly 50 monthly points. That is short for a
-    seasonal model: treat these as trend scenarios, not predictions.
-  - The SARIMA order below is a simple default, not tuned per source.
-  - Months with fewer than MIN_DAYS reported are dropped and
-    interpolated, same rule as the main pipeline.
-  - Output stops at the last real observation: no padding past the data.
-
-Output: source_forecasts_2040.xlsx with sheets "history" and "forecast".
-"""
+"""Forecast electricity generation by source. Run with: python source_forecast.py."""
 
 import warnings
 warnings.filterwarnings("ignore")

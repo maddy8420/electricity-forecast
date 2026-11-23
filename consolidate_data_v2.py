@@ -1,29 +1,9 @@
-"""
-India Electricity Data Consolidation (v2)
---------------------------------------------
-Fixes a hierarchy problem in Daily_Power_Gen_Source_march_23.csv:
-CEA changed its reporting granularity partway through the dataset.
-  - Early period: 'Thermal (Coal & Lignite)' reported as one combined row
-  - Later period: 'Coal' and 'Lignite' itemized separately
-  - Similarly: 'RES (Wind, Solar, Biomass & Others)' combined vs.
-    'Wind Gen' / 'Solar Gen' itemized separately in other periods
-Summing all non-Total rows blindly double-counts on any date where both
-a parent category and its components happen to be present.
-
-Fix: never recompute the national total from parts — trust the reported
-'Total' row directly. For source-composition analysis, build harmonized
-columns that use the itemized value when available and fall back to the
-combined value when not, so you get one continuous series across the
-whole reporting-format change instead of holes.
-"""
+"""Consolidate electricity generation, demand, and consumption data. Run with: python consolidate_data_v2.py."""
 
 import re
 import pandas as pd
 from pathlib import Path
 
-# ----------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------
 
 DATA_DIR = Path("data")
 OUTPUT_FILE = "india_electricity_master.xlsx"
@@ -44,9 +24,6 @@ def clean_colname(c):
     return c
 
 
-# ----------------------------------------------------------------------
-# LOADERS
-# ----------------------------------------------------------------------
 
 def load_gen_by_source():
     df = pd.read_csv(FILES["gen_by_source"])
@@ -102,9 +79,6 @@ def load_monthly_temp():
     return df
 
 
-# ----------------------------------------------------------------------
-# GENERATION: raw pivot + harmonized hierarchy-aware columns
-# ----------------------------------------------------------------------
 
 def build_generation_tables(by_source, source_totals):
     # Raw pivot, exactly as reported, NaN where a category wasn't reported that day.
@@ -132,10 +106,7 @@ def build_generation_tables(by_source, source_totals):
         coal.notna() | lignite.notna(), thermal_combined
     )
 
-    # Renewables family: prefer combined RES figure (most complete — includes
-    # biomass/others); only fall back to Wind+Solar sum on dates RES is missing
-    # (this fallback will UNDERSTATE renewables slightly, since it excludes
-    # biomass/others — flagged here rather than silently absorbed).
+    # Prefer combined RES data because Wind+Solar omits biomass and other sources.
     itemized_wind_solar = wind.fillna(0) + solar.fillna(0)
     harmonized["renewables_mu"] = res_combined.where(
         res_combined.notna(), itemized_wind_solar
@@ -152,19 +123,14 @@ def build_generation_tables(by_source, source_totals):
 
     harmonized = harmonized.reset_index()
 
-    # DATA ERA FLAG — before 2017-05-26, only Hydro/Wind(/Solar from 2016) are
-    # separable; Coal, Lignite, Nuclear, and Gas are all bundled inside 'Total'
-    # with no way to split them individually. Don't let downstream charts imply
-    # precision that doesn't exist for this period.
+    # Before 2017-05-26, the reporting format does not separate all generation sources.
     era_cutoff = pd.Timestamp("2017-05-26")
     harmonized["data_era"] = harmonized["date"].apply(
         lambda d: "2013-2017 (aggregated reporting)" if d < era_cutoff
         else "2017-2023 (detailed reporting)"
     )
 
-    # For the aggregated era, coal/nuclear/gas can't be split — null them out
-    # explicitly rather than leaving a misleading partial value, and instead
-    # provide one honest 'other_mu' residual (Total minus what IS separable).
+    # Keep inseparable early-era generation sources in an honest residual bucket.
     early_mask = harmonized["date"] < era_cutoff
     harmonized.loc[early_mask, ["coal_lignite_mu", "nuclear_mu", "gas_naptha_diesel_mu"]] = pd.NA
 
@@ -175,11 +141,9 @@ def build_generation_tables(by_source, source_totals):
         .reset_index()
     )
 
-    # 'other_mu': for the aggregated era only, this is Total minus the parts
-    # we CAN separate (Hydro + Wind + Solar) — an honest single bucket for
-    # Coal+Lignite+Nuclear+Gas+Biomass combined, since the raw data gives no
-    # way to split them further in this period. Left as NaN in the detailed
-    # era, since every source is already accounted for individually there.
+    # Trust the reported Total to avoid double-counting parent and component rows.
+
+    # Use other_mu only for the aggregated era because detailed-era sources are itemized.
     harmonized = harmonized.merge(total_reported, on="date", how="left")
     known_early = (
         harmonized["hydro_mu"].fillna(0)
@@ -223,20 +187,7 @@ def build_hourly_agg_daily(hourly_load):
 
 
 def build_monthly_master(total_reported, harmonized, demand_daily, hourly_daily, consumption, temp):
-    """
-    Roll up to monthly resolution using AVERAGE DAILY VALUE, not sum.
-
-    Why: several months in the raw data have severe under-reporting
-    (e.g. Dec 2022 has only 4 days reported vs a normal ~30). Summing those
-    days produces a monthly 'total' that's mechanically tiny compared to a
-    fully-reported month — which then creates fake 600%+ YoY growth spikes
-    a year later when compared against a properly-reported month. Averaging
-    the days that WERE reported is far more robust to uneven coverage.
-
-    A day-coverage count is kept alongside every metric so any month with
-    suspiciously low coverage can be flagged/filtered rather than silently
-    trusted.
-    """
+    """Roll up daily metrics to monthly averages with day-coverage counts."""
     def to_month(df, date_col="date"):
         out = df.copy()
         out["year_month"] = pd.to_datetime(out[date_col]).dt.to_period("M")
@@ -261,13 +212,7 @@ def build_monthly_master(total_reported, harmonized, demand_daily, hourly_daily,
     master = master.merge(temp[["year_month", "Monthly_load", "max_temp"]], on="year_month", how="left")
     master["year_month"] = master["year_month"].astype(str)
 
-    # Flag low-coverage months — but only using metrics that are tracked
-    # across the ENTIRE date range (generation, demand, consumption,
-    # renewables, hydro). Coal/Nuclear/Gas are deliberately NaN for the
-    # whole 2013-2017 era (structural limitation, not a coverage problem)
-    # — including their coverage columns here would wrongly flag ~50 months
-    # that have perfectly good demand/generation data just because coal
-    # wasn't itemized yet.
+    # Use only coverage columns present throughout the full date range.
     core_coverage_cols = [
         "days_reported_generation", "days_reported_demand",
         "days_reported_consumption", "days_reported_renewables",
@@ -279,9 +224,6 @@ def build_monthly_master(total_reported, harmonized, demand_daily, hourly_daily,
     return master
 
 
-# ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
 
 def main():
     print("Loading raw files...")
@@ -331,6 +273,7 @@ def main():
     try:
         save_sheets(OUTPUT_FILE)
     except PermissionError:
+        # If Excel locks the master workbook, save to the alternate filename.
         fallback_file = "india_electricity_master_new.xlsx"
         print(f"\n[WARNING] Permission denied when writing to '{OUTPUT_FILE}'.")
         print(f"  The file is currently open in Excel or another application.")

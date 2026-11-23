@@ -1,34 +1,9 @@
-"""
-daily_predictor.py
-------------------
-Provides day-level electricity demand prediction by multiplying a monthly
-baseline (from historical data or SARIMA forecast) by a day-of-week profile
-built from actual daily reported data.
+"""Predict daily electricity demand from monthly forecasts and daily profiles. Run with: python daily_predictor.py."""
 
-Improvements over v1:
-  - Outlier cleaning: days where energy_met / month_median > 1.4 or < 0.6
-    are excluded from profile building, monthly baseline computation, peak
-    factor, and backtest scoring.
-  - Profile variant: DOW-only (global weekday factors, not month×DOW cells).
-    Ratios winsorised at 1st/99th percentile. COVID excluded (2020-03-24 to
-    2020-06-30).
-  - Holiday shrinkage: multiplier = 1 + (raw-1) * n / (n+5) when n >= 5,
-    else 1.0.  This avoids extreme spikes from small-n holiday cells.
-  - Modes: "historical" (<=2023-03-31), "actual_monthly" (2023-04 onward
-    while avg_daily_consumption exists), "forecast" (demand_fc index).
-
-No streamlit import. No network access. Pure pandas + numpy.
-"""
-
-import io
-import contextlib
 import warnings
 import numpy as np
 import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Holiday helpers (soft dependency)
-# ---------------------------------------------------------------------------
 _HOLIDAYS_AVAILABLE = False
 try:
     import holidays as _holidays_lib
@@ -43,15 +18,12 @@ COVID_START = pd.Timestamp("2020-03-24")
 COVID_END   = pd.Timestamp("2020-06-30")
 
 # Outlier threshold: flag days where energy_met deviates from month median
+# Ratios above 1.4 or below 0.6 are treated as duplicate-reporting artefacts.
 OUTLIER_HI = 1.4
 OUTLIER_LO = 0.6
 
 # Minimum days in a month for the month to be used
 MIN_DAYS_MONTH = 20
-
-# Backtest profile variant: "dow_shrunk" wins H1+H2 combined MAPE (see backtest())
-PROFILE_VARIANT = "dow_shrunk"
-
 
 def _get_india_holidays(year: int) -> dict:
     """Return {date: name} for India national holidays in a given year."""
@@ -70,110 +42,35 @@ def _holiday_name(d: pd.Timestamp) -> "str | None":
     return h.get(d.date(), None)
 
 
-# ---------------------------------------------------------------------------
-# B1: Cleaning — flag outlier days
-# ---------------------------------------------------------------------------
-
-def get_flagged_days(daily_df: pd.DataFrame) -> tuple:
-    """
-    Identify outlier days in national_demand_daily.
-
-    A day is flagged if:
-      national_energy_met_mu / (that month's median over all days with data) > 1.4
-      OR < 0.6
-
-    COVID window (2020-03-24 to 2020-06-30) is NOT flagged separately here —
-    it is excluded in build_profile / backtest by its own filter.
-
-    Parameters
-    ----------
-    daily_df : DataFrame with columns date, national_energy_met_mu.
-
-    Returns
-    -------
-    (flagged_set, counts_per_year)
-        flagged_set     : set of pd.Timestamp (dates that are flagged)
-        counts_per_year : dict {year: int}
-    """
-    df = daily_df[["date", "national_energy_met_mu"]].copy()
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.dropna(subset=["national_energy_met_mu"]).sort_values("date")
-
-    df["_ym"] = df["date"].dt.to_period("M")
-    df["_month_median"] = df.groupby("_ym")["national_energy_met_mu"].transform("median")
-    df["_ratio"] = df["national_energy_met_mu"] / df["_month_median"]
-    flagged = df[(df["_ratio"] > OUTLIER_HI) | (df["_ratio"] < OUTLIER_LO)]
-
-    flagged_set = set(pd.to_datetime(flagged["date"]))
-    counts_per_year = (
-        flagged.set_index("date")
-        .resample("YE")
-        .size()
-        .rename("count")
-        .to_dict()
-    )
-    # Simplify keys to integer years
-    counts_per_year = {k.year: v for k, v in counts_per_year.items() if v > 0}
-    return flagged_set, counts_per_year
-
-
-# ---------------------------------------------------------------------------
-# B2: build_profile — DOW-only variant with winsorisation and shrunk holidays
-# ---------------------------------------------------------------------------
 
 def build_profile(daily: pd.DataFrame) -> dict:
-    """
-    Build intra-month day-of-week profile from national_demand_daily.
-
-    Parameters
-    ----------
-    daily : DataFrame with columns date, national_energy_met_mu,
-            national_max_demand_mw. Already loaded; not modified.
-
-    Returns
-    -------
-    dict with keys:
-        profile           : dict keyed dayofweek -> {mean, q05, q95, n}
-        dow_fallback      : same as profile (kept for API compatibility)
-        peak_factor       : dict keyed month -> median peak_factor (cleaned days)
-        holiday_mults     : DataFrame with holiday multipliers
-        holiday_name_to_mult : dict {holiday_name: multiplier}
-        df                : cleaned working DataFrame used for the profile
-        flagged_set       : set of flagged Timestamps
-        flagged_per_year  : dict {year: count}
-    """
+    """Build a day-of-week demand profile from reported daily data."""
     df = daily[["date", "national_energy_met_mu", "national_max_demand_mw"]].copy()
     df["date"] = pd.to_datetime(df["date"])
     df = df.dropna(subset=["national_energy_met_mu"])
     df = df.sort_values("date").reset_index(drop=True)
 
-    # Exclude COVID lockdown window
+    # Exclude the COVID lockdown window from profile calculations.
     df = df[~((df["date"] >= COVID_START) & (df["date"] <= COVID_END))].copy()
 
-    # Flag outlier days (before month-coverage filter so median is over all days)
     df["_ym"] = df["date"].dt.to_period("M")
     df["_month_median"] = df.groupby("_ym")["national_energy_met_mu"].transform("median")
     df["_ratio_raw"] = df["national_energy_met_mu"] / df["_month_median"]
     df["_flagged"] = (df["_ratio_raw"] > OUTLIER_HI) | (df["_ratio_raw"] < OUTLIER_LO)
 
-    # Keep only months with >= 20 non-flagged reported days
     non_flagged = df[~df["_flagged"]]
     cov = non_flagged.groupby("_ym")["date"].count().rename("n_days")
     good_months = cov[cov >= MIN_DAYS_MONTH].index
     df = df[df["_ym"].isin(good_months)].copy()
 
-    # Recompute month mean on cleaned (non-flagged) days within good months
     clean = df[~df["_flagged"]].copy()
     clean_mean = clean.groupby("_ym")["national_energy_met_mu"].mean().rename("_clean_mean")
     df = df.join(clean_mean, on="_ym")
-    # ratio = day / cleaned-month-mean (use clean_mean for all days including flagged for context,
-    # but only non-flagged days feed the profile)
     df["ratio"] = df["national_energy_met_mu"] / df["_clean_mean"]
 
     df["month"] = df["date"].dt.month
     df["dow"]   = df["date"].dt.dayofweek   # 0=Mon…6=Sun
 
-    # Identify holiday days
     if _HOLIDAYS_AVAILABLE:
         holiday_cache: dict = {}
         def _is_holiday(d):
@@ -185,10 +82,8 @@ def build_profile(daily: pd.DataFrame) -> dict:
     else:
         df["_is_holiday"] = False
 
-    # Build DOW profile on non-flagged, non-holiday days
     work = df[~df["_flagged"] & ~df["_is_holiday"]].copy()
 
-    # Winsorise ratios at 1st/99th percentile
     p01 = work["ratio"].quantile(0.01)
     p99 = work["ratio"].quantile(0.99)
     work["ratio_w"] = work["ratio"].clip(p01, p99)
@@ -202,13 +97,10 @@ def build_profile(daily: pd.DataFrame) -> dict:
             "n":    len(r),
         })
 
-    # DOW-only profile (global across all months)
     dow_df = work.groupby("dow").apply(_stats, include_groups=False)
     profile = {d: row.to_dict() for d, row in dow_df.iterrows()}
     dow_fallback = profile  # same for API compatibility
 
-    # Peak factor per month: median(max_demand_mw / (energy_met_mu*1000/24))
-    # on cleaned (non-flagged) days only
     clean_pf = df[~df["_flagged"]].copy()
     clean_pf["_pf"] = (
         clean_pf["national_max_demand_mw"]
@@ -216,7 +108,6 @@ def build_profile(daily: pd.DataFrame) -> dict:
     )
     peak_factor = clean_pf.groupby("month")["_pf"].median().to_dict()
 
-    # Holiday multipliers with shrinkage
     hol_df = df[df["_is_holiday"] & ~df["_flagged"]].copy()
     if _HOLIDAYS_AVAILABLE and len(hol_df) > 0:
         name_cache: dict = {}
@@ -227,16 +118,13 @@ def build_profile(daily: pd.DataFrame) -> dict:
             return name_cache[yr].get(d.date(), "Unknown")
         hol_df["_hname"] = hol_df["date"].apply(lambda d: _hname(d))
 
-        # Holiday residual = ratio / DOW profile mean for that day
         def _prof_mean(row):
             dow_key = row["dow"]
             return profile.get(dow_key, {"mean": 1.0})["mean"]
         hol_df["_prof_mean"] = hol_df.apply(_prof_mean, axis=1)
-        # Use the ratio column (winsorise with same bounds as work set)
         hol_df["_ratio_w"] = hol_df["ratio"].clip(p01, p99)
         hol_df["_hol_residual"] = hol_df["_ratio_w"] / hol_df["_prof_mean"]
 
-        # Per holiday: median residual and count
         hol_stats = hol_df.groupby("_hname")["_hol_residual"].agg(["median", "count"])
 
         # Shrinkage: m = 1 + (raw - 1) * n / (n + 5)  when n >= 5, else 1.0
@@ -255,7 +143,6 @@ def build_profile(daily: pd.DataFrame) -> dict:
         holiday_name_to_mult = {}
         holiday_mults = pd.DataFrame(columns=["holiday", "median", "n", "multiplier"])
 
-    # Collect flagged days info
     flagged_set = set(df[df["_flagged"]]["date"])
     flagged_per_year = (
         df[df["_flagged"]].set_index("date")
@@ -277,9 +164,6 @@ def build_profile(daily: pd.DataFrame) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# _get_day_profile
-# ---------------------------------------------------------------------------
 
 def _get_day_profile(d: pd.Timestamp, prof: dict) -> dict:
     """Return {mean, q05, q95} for a given date using the DOW profile."""
@@ -287,41 +171,27 @@ def _get_day_profile(d: pd.Timestamp, prof: dict) -> dict:
     return prof["profile"].get(dow, {"mean": 1.0, "q05": 0.9, "q95": 1.1, "n": 0})
 
 
-# ---------------------------------------------------------------------------
-# B3/B4: predict_day — updated modes
-# ---------------------------------------------------------------------------
 
 def _compute_consumption_ratio(master_monthly: pd.DataFrame, flagged_set: set,
                                 daily_df: pd.DataFrame) -> tuple:
-    """
-    Compute r = median(avg_daily_consumption / cleaned_demand) over
-    2019-01..2022-12 with >= 25 days_reported_consumption and no flagged days.
-
-    Returns (r, n_months_used, r_is_identity)
-    where r_is_identity is True when |r-1| < 0.005.
-    """
+    """Compute the calibrated consumption-to-demand ratio from eligible months."""
     mm = master_monthly.copy()
     mm["year_month"] = mm["year_month"].astype(str).str[:7]
 
-    # Filter to calibration window
     mm = mm[(mm["year_month"] >= "2019-01") & (mm["year_month"] <= "2022-12")].copy()
 
-    # Need both consumption and demand columns
     cons_col = "avg_daily_consumption" if "avg_daily_consumption" in mm.columns else None
     if cons_col is None or "avg_daily_demand" not in mm.columns:
         return 1.0, 0, True
 
     mm = mm.dropna(subset=[cons_col, "avg_daily_demand"])
 
-    # days_reported_consumption >= 25 (if column exists)
     if "days_reported_consumption" in mm.columns:
         mm = mm[mm["days_reported_consumption"] >= 25]
 
-    # Exclude low_coverage months
     if "low_coverage_flag" in mm.columns:
         mm = mm[mm["low_coverage_flag"] == False]
 
-    # Exclude months that contain any flagged days
     if flagged_set and daily_df is not None:
         df_tmp = daily_df[["date", "national_energy_met_mu"]].copy()
         df_tmp["date"] = pd.to_datetime(df_tmp["date"])
@@ -349,35 +219,16 @@ def predict_day(
     master_monthly: pd.DataFrame,
     profile: dict,
 ) -> dict:
-    """
-    Predict electricity demand for a single day.
-
-    Parameters
-    ----------
-    d             : date-like (date, str, or Timestamp)
-    demand_fc     : avg_daily_demand_forecast_2040 DataFrame (index=Timestamps)
-    gen_fc        : avg_daily_generation_forecast_2040 DataFrame (index=Timestamps)
-    daily         : national_demand_daily DataFrame
-    master_monthly: MASTER_monthly DataFrame (year_month as str)
-    profile       : output of build_profile()
-
-    Returns
-    -------
-    dict with keys: date, mode, baseline_mu, estimate_mu, low_mu, high_mu,
-    actual_mu, weekday_factor, holiday_name, holiday_mult,
-    peak_mw_estimate, validated, notes.
-    """
+    """Predict electricity demand for a single day."""
     notes = []
     d = pd.Timestamp(d)
     month_start = d.to_period("M").to_timestamp()
 
-    # Ensure daily date column is Timestamp
     daily = daily.copy()
     daily["date"] = pd.to_datetime(daily["date"])
 
     flagged_set = profile.get("flagged_set", set())
 
-    # ---- Holiday lookup ----
     holiday_name = None
     holiday_mult = 1.0
     try:
@@ -388,19 +239,15 @@ def predict_day(
         notes.append(f"Holiday lookup failed: {e}; multiplier set to 1.0")
         holiday_mult = 1.0
 
-    # ---- Day profile (DOW-only) ----
     dp = _get_day_profile(d, profile)
     weekday_factor = dp["mean"]
     q05 = dp["q05"]
     q95 = dp["q95"]
 
-    # ---- Peak factor for this month ----
     peak_factor = profile["peak_factor"].get(d.month, None)
 
-    # ---- Determine mode ----
     HIST_END = pd.Timestamp("2023-03-31")
 
-    # Determine last month with avg_daily_consumption
     mm_tmp = master_monthly.copy()
     mm_tmp["year_month"] = mm_tmp["year_month"].astype(str).str[:7]
     cons_col = "avg_daily_consumption" if "avg_daily_consumption" in mm_tmp.columns else None
@@ -416,7 +263,6 @@ def predict_day(
     ym_str = d.to_period("M").strftime("%Y-%m")
 
     if d <= HIST_END:
-        # ---- HISTORICAL mode ----
         mode = "historical"
         validated = True
 
@@ -435,13 +281,11 @@ def predict_day(
                 "notes": [f"Insufficient daily data for {ym_str} ({days_reported} days reported < {MIN_DAYS_MONTH})."]
             }
 
-        # Baseline = cleaned mean for this month (non-flagged days)
         df_month = daily[daily["date"].dt.to_period("M").dt.strftime("%Y-%m") == ym_str].copy()
         df_month_clean = df_month[~df_month["date"].isin(flagged_set)]
         if len(df_month_clean) >= MIN_DAYS_MONTH:
             baseline = float(df_month_clean["national_energy_met_mu"].mean())
         else:
-            # Fall back to stored avg_daily_demand if too few clean days
             baseline = mm_row["avg_daily_demand"].values[0]
             if pd.isna(baseline):
                 return {
@@ -454,7 +298,6 @@ def predict_day(
         baseline_lo = baseline
         baseline_hi = baseline
 
-        # Actual value for this specific day
         actual_row = daily[daily["date"] == d]
         if len(actual_row) == 1:
             actual_mu = float(actual_row["national_energy_met_mu"].values[0])
@@ -469,7 +312,6 @@ def predict_day(
 
     elif (last_cons_month is not None and ym_str <= last_cons_month
           and cons_col is not None):
-        # ---- ACTUAL_MONTHLY mode (2023-04 to last consumption month) ----
         mode = "actual_monthly"
         validated = False
         actual_mu = None
@@ -484,7 +326,6 @@ def predict_day(
 
         raw_cons = float(mm_row[cons_col].values[0])
 
-        # days_reported_consumption warning
         if "days_reported_consumption" in mm_row.columns:
             days_rep_cons = mm_row["days_reported_consumption"].values[0]
             if not pd.isna(days_rep_cons) and days_rep_cons < 20:
@@ -493,7 +334,6 @@ def predict_day(
                     f"(< 20); consumption figure may be unreliable."
                 )
 
-        # Calibration ratio r
         r, n_cal, r_is_identity = _compute_consumption_ratio(
             master_monthly, flagged_set, daily
         )
@@ -511,7 +351,6 @@ def predict_day(
         baseline_hi = baseline
 
     elif month_start in demand_fc.index:
-        # ---- FORECAST mode ----
         mode = "forecast"
         row = demand_fc.loc[month_start]
         baseline    = float(row["forecast"])
@@ -527,12 +366,10 @@ def predict_day(
             "notes": [f"Date {d.date()} is outside all available data and forecast ranges."]
         }
 
-    # ---- Apply day factor and holiday multiplier ----
     estimate = baseline    * weekday_factor * holiday_mult
     low      = baseline_lo * q05            * holiday_mult
     high     = baseline_hi * q95            * holiday_mult
 
-    # ---- Peak estimate ----
     peak_mw = None
     if peak_factor is not None:
         peak_mw = estimate * 1000.0 / 24.0 * peak_factor
@@ -555,61 +392,16 @@ def predict_day(
     return result
 
 
-# ---------------------------------------------------------------------------
-# B3: backtest — 4 variants, 2 holdouts, non-flagged days only
-# ---------------------------------------------------------------------------
-
-def _build_dow_profile_on(train_df: pd.DataFrame, variant: str = "dow") -> dict:
-    """Build a lightweight profile dict on the given (already cleaned) train_df."""
-    # train_df has columns: date, national_energy_met_mu, _ym, ratio_w, dow, _is_holiday
-    non_hol = train_df[~train_df["_is_holiday"]]
-
-    def _stats(group):
-        r = group["ratio_w"]
-        return pd.Series({
-            "mean": r.mean(),
-            "q05":  r.quantile(0.05),
-            "q95":  r.quantile(0.95),
-            "n":    len(r),
-        })
-
-    if variant == "flat":
-        # ratio = 1 for all days
-        profile = {d: {"mean": 1.0, "q05": 1.0, "q95": 1.0, "n": 0} for d in range(7)}
-    elif variant in ("dow", "dow_shrunk", "dow_raw"):
-        dow_df = non_hol.groupby("dow").apply(_stats, include_groups=False)
-        profile = {d: row.to_dict() for d, row in dow_df.iterrows()}
-    else:
-        profile = {d: {"mean": 1.0, "q05": 1.0, "q95": 1.0, "n": 0} for d in range(7)}
-
-    return profile
-
 
 def backtest(daily: pd.DataFrame, holdout_months: int = 12) -> dict:
-    """
-    Backtest the day-of-week profile by holding out the last `holdout_months`
-    full-coverage months.
-
-    Uses TRUE monthly cleaned mean as baseline (isolates day-allocation error
-    only). Scores only non-flagged days.
-
-    Two holdouts run internally: H1 (last 12 months) and H2 (prior 12 months).
-    Winner = variant with lower total MAPE across H1+H2. Tie-break: flat < dow.
-
-    Returns
-    -------
-    dict: n_days, MAE, MAPE (profile), MAPE_naive (flat mean, ratio=1),
-          coverage (fraction of actual values within [q05, q95] band),
-          holdout_months, variant_mape_table (H1 and H2 for 4 variants).
-    """
+    """Backtest day-of-week profiles on full-coverage holdout months."""
     df_all = daily.copy()
     df_all["date"] = pd.to_datetime(df_all["date"])
     df_all = df_all.dropna(subset=["national_energy_met_mu"])
 
-    # Exclude COVID window
+    # Exclude the COVID lockdown window from backtest scoring.
     df_all = df_all[~((df_all["date"] >= COVID_START) & (df_all["date"] <= COVID_END))].copy()
 
-    # Flag outliers
     df_all["_ym"] = df_all["date"].dt.to_period("M")
     df_all["_month_median"] = df_all.groupby("_ym")["national_energy_met_mu"].transform("median")
     df_all["_flagged"] = (
@@ -617,14 +409,12 @@ def backtest(daily: pd.DataFrame, holdout_months: int = 12) -> dict:
         (df_all["national_energy_met_mu"] / df_all["_month_median"] < OUTLIER_LO)
     )
 
-    # Keep only months with >= MIN_DAYS_MONTH non-flagged days
     cov = df_all[~df_all["_flagged"]].groupby("_ym")["date"].count()
     full_months = cov[cov >= MIN_DAYS_MONTH].index.sort_values()
 
     if len(full_months) <= 2 * holdout_months:
         return {"error": "Not enough full-coverage months for two-holdout backtest."}
 
-    # Holiday flags
     if _HOLIDAYS_AVAILABLE:
         holiday_cache: dict = {}
         def _is_holiday(d):
@@ -638,15 +428,11 @@ def backtest(daily: pd.DataFrame, holdout_months: int = 12) -> dict:
 
     df_all["dow"] = df_all["date"].dt.dayofweek
 
-    # Winsorise ratio within each holdout's training set (done per fold below)
     variants = ["flat", "dow", "dow_shrunk", "dow_raw"]
     results_h1 = {}
     results_h2 = {}
 
-    for holdout_idx, (ho_label, ho_results) in enumerate(
-        [("H1", results_h1), ("H2", results_h2)]
-    ):
-        # H1 = last holdout_months; H2 = prior holdout_months
+    for holdout_idx, ho_results in enumerate([results_h1, results_h2]):
         if holdout_idx == 0:
             test_months  = full_months[-holdout_months:]
             train_months = full_months[:-holdout_months]
@@ -662,10 +448,8 @@ def backtest(daily: pd.DataFrame, holdout_months: int = 12) -> dict:
         train_df = df_all[df_all["_ym"].isin(train_months) & ~df_all["_flagged"]].copy()
         test_df  = df_all[df_all["_ym"].isin(test_months) & ~df_all["_flagged"]].copy()
 
-        # Compute cleaned month mean for test months
         test_df["_clean_mean"] = test_df.groupby("_ym")["national_energy_met_mu"].transform("mean")
 
-        # Winsorise ratios on training set
         train_clean_mean = train_df.groupby("_ym")["national_energy_met_mu"].transform("mean")
         train_df = train_df.copy()
         train_df["ratio_w"] = train_df["national_energy_met_mu"] / train_clean_mean
@@ -673,11 +457,8 @@ def backtest(daily: pd.DataFrame, holdout_months: int = 12) -> dict:
         p99 = train_df["ratio_w"].quantile(0.99)
         train_df["ratio_w"] = train_df["ratio_w"].clip(p01, p99)
 
-        # Holiday residuals for shrunk/raw variants
         hol_train = train_df[train_df["_is_holiday"]].copy()
-        hol_non = train_df[~train_df["_is_holiday"]].copy()
 
-        # Base DOW profile
         def _base_dow(df_in):
             g = df_in[~df_in["_is_holiday"]].groupby("dow")["ratio_w"]
             return g.mean().to_dict()
@@ -691,7 +472,6 @@ def backtest(daily: pd.DataFrame, holdout_months: int = 12) -> dict:
                 test_df["_pf"] = test_df["dow"].map(base_dow).fillna(1.0)
                 pred = (test_df["_clean_mean"] * test_df["_pf"]).values
             elif v in ("dow_shrunk", "dow_raw"):
-                # Compute holiday name residuals on training data
                 hol_name_mult = {}
                 if _HOLIDAYS_AVAILABLE and len(hol_train) > 0:
                     name_cache2: dict = {}
@@ -714,7 +494,6 @@ def backtest(daily: pd.DataFrame, holdout_months: int = 12) -> dict:
                             m = raw_m if n >= 5 else 1.0
                         hol_name_mult[hname] = m
 
-                # Apply to test
                 def _test_mult(row):
                     if not row["_is_holiday"]:
                         return base_dow.get(row["dow"], 1.0)
@@ -742,7 +521,6 @@ def backtest(daily: pd.DataFrame, holdout_months: int = 12) -> dict:
         )
     )
 
-    # Score the primary holdout (H1) with the best variant
     test_months  = full_months[-holdout_months:]
     train_months = full_months[:-holdout_months]
     train_df = df_all[df_all["_ym"].isin(train_months) & ~df_all["_flagged"]].copy()
@@ -763,7 +541,6 @@ def backtest(daily: pd.DataFrame, holdout_months: int = 12) -> dict:
     estimate = test_df["estimate"].values
     naive    = test_df["naive"].values
 
-    # CI from winsorised q05/q95 per DOW
     def _q05(d):
         dow_key = int(d)
         p = train_df[train_df["dow"] == dow_key]["ratio_w"]

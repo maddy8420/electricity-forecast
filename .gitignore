@@ -19,3 +19,5 @@ india_electricity_master_new.xlsx
 
 # Regeneratable outputs (uncomment if you'd rather not commit these)
 # figures/
+tmp*.txt
+*_refit.xlsx
